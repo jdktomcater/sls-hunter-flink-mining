@@ -137,7 +137,25 @@ public final class PostgresSnapshotSink extends RichSinkFunction<String>
 
   @Override
   public void snapshotState(FunctionSnapshotContext context) throws Exception {
-    ((CheckpointedFunction) delegate).snapshotState(context);
+    long started = System.nanoTime();
+    try {
+      ((CheckpointedFunction) delegate).snapshotState(context);
+    } finally {
+      long elapsedMillis = (System.nanoTime() - started) / 1_000_000;
+      if (elapsedMillis >= 1000) {
+        LOG.warn(
+            "Slow JDBC checkpoint flush: table={}, checkpointId={}, elapsedMillis={}",
+            table,
+            context.getCheckpointId(),
+            elapsedMillis);
+      } else {
+        LOG.debug(
+            "JDBC checkpoint flush: table={}, checkpointId={}, elapsedMillis={}",
+            table,
+            context.getCheckpointId(),
+            elapsedMillis);
+      }
+    }
   }
 
   @Override

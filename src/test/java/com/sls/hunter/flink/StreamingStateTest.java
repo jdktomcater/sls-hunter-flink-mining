@@ -34,8 +34,8 @@ class StreamingStateTest {
     return harness(config());
   }
 
-  static KeyedOneInputStreamOperatorTestHarness<String, Event, String> harness(MiningConfig miningConfig)
-      throws Exception {
+  static KeyedOneInputStreamOperatorTestHarness<String, Event, String> harness(
+      MiningConfig miningConfig) throws Exception {
     return new KeyedOneInputStreamOperatorTestHarness<String, Event, String>(
         new KeyedProcessOperator<String, Event, String>(new MiningProcessFunction(miningConfig)),
         new KeySelector<Event, String>() {
@@ -114,7 +114,10 @@ class StreamingStateTest {
         harness(new MiningConfig(properties))) {
       h.open();
       h.setProcessingTime(now);
-      send(h, RulesTest.event("plain", "tracing_sas_linux", "2026-06-10", "10.0.0.2", "echo", "echo hi"));
+      send(
+          h,
+          RulesTest.event(
+              "plain", "tracing_sas_linux", "2026-06-10", "10.0.0.2", "echo", "echo hi"));
       send(
           h,
           RulesTest.event(
@@ -130,7 +133,9 @@ class StreamingStateTest {
       assertTrue(((List<?>) snapshot.get("baseline_dates")).isEmpty());
       List<Map<String, Object>> signals = (List<Map<String, Object>>) snapshot.get("all_signals");
       assertTrue(signals.stream().noneMatch(signal -> "echo".equals(signal.get("proc_name"))));
-      assertTrue(signals.stream().anyMatch(signal -> "reverse_shell".equals(signal.get("behavior_label"))));
+      assertTrue(
+          signals.stream()
+              .anyMatch(signal -> "reverse_shell".equals(signal.get("behavior_label"))));
       assertTrue(
           signals.stream()
               .noneMatch(
@@ -178,6 +183,71 @@ class StreamingStateTest {
       h.setProcessingTime(now + 10);
       assertEquals("PROVISIONAL", last(h).get("status"));
       assertFalse(((List<?>) last(h).get("all_signals")).isEmpty());
+    }
+  }
+
+  @Test
+  void partialFlushSurvivesCheckpointWithoutLossOrDuplicateCounts() throws Exception {
+    verifyPartialFlushRestore(false);
+    verifyPartialFlushRestore(true);
+  }
+
+  private void verifyPartialFlushRestore(boolean rocksDb) throws Exception {
+    Properties properties = new Properties();
+    properties.putAll(config().properties);
+    properties.setProperty("flush.max.events", "1");
+    properties.setProperty("flush.max.ms", "60000");
+    MiningConfig sliced = new MiningConfig(properties);
+    long now = Instant.parse("2026-06-11T00:00:00Z").toEpochMilli();
+    Event a = RulesTest.event("a", "tracing_sas_linux", "2026-06-10", "host", "echo", "echo hi");
+    Event b = RulesTest.event("b", "tracing_sas_linux", "2026-06-10", "host", "echo", "echo hi");
+    Map<String, Object> expected;
+    try (KeyedOneInputStreamOperatorTestHarness<String, Event, String> h = harness()) {
+      h.open();
+      h.setProcessingTime(now);
+      send(h, seal("2026-06-09"));
+      send(h, a);
+      send(h, b);
+      send(h, seal("2026-06-10"));
+      h.setProcessingTime(now + 10);
+      expected = last(h);
+    }
+    OperatorSubtaskState checkpoint;
+    try (KeyedOneInputStreamOperatorTestHarness<String, Event, String> h = harness(sliced)) {
+      if (rocksDb) {
+        h.setStateBackend(
+            new org.apache.flink.contrib.streaming.state.EmbeddedRocksDBStateBackend(true));
+      }
+      h.open();
+      h.setProcessingTime(now);
+      send(h, seal("2026-06-09"));
+      send(h, a);
+      send(h, b);
+      send(h, seal("2026-06-10"));
+      send(h, a); // 同一待处理身份只保留一份。
+      h.setProcessingTime(now + 10);
+      assertTrue(h.extractOutputValues().isEmpty());
+      checkpoint = h.snapshot(11, now + 10);
+    }
+    try (KeyedOneInputStreamOperatorTestHarness<String, Event, String> h = harness(sliced)) {
+      if (rocksDb) {
+        h.setStateBackend(
+            new org.apache.flink.contrib.streaming.state.EmbeddedRocksDBStateBackend(true));
+      }
+      h.initializeState(checkpoint);
+      h.open();
+      for (int i = 11; i <= 15; i++) {
+        h.setProcessingTime(now + i);
+      }
+      Map<String, Object> actual = last(h);
+      assertEquals(1, h.extractOutputValues().size());
+      for (String field :
+          J8.list("all_signals", "shallow_candidates", "stats", "status", "revision")) {
+        assertEquals(expected.get(field), actual.get(field), field);
+      }
+      send(h, a); // 已折进日桶的身份恢复后仍然去重。
+      h.setProcessingTime(now + 25);
+      assertEquals(1, h.extractOutputValues().size());
     }
   }
 

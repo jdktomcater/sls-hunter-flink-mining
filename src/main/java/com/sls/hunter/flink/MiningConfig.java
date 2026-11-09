@@ -18,21 +18,33 @@ import java.util.Properties;
 public final class MiningConfig implements Serializable {
   public final Properties properties;
   public final int baselineDays;
+
   /** 为 false 时不读基线、不等封账和 fleet 快照，只跑行为模式和命令结构规则。 */
   public final boolean historyCompare;
+
   public final int minCount;
   public final int maxSignals;
   public final int retentionDays;
   public final long emitMillis;
+  public final int flushMaxEvents;
+  public final long flushMaxMillis;
+  public final long checkpointMinPauseMillis;
+  public final boolean checkpointUnaligned;
+  public final long checkpointAlignedTimeoutMillis;
   public final long latenessMillis;
+
   /** 固定滚动窗口长度。只给 {@code WindowMiningJob} 使用，按日作业不读它。 */
   public final long windowSizeMillis;
+
   /** 事件时间乱序上限，用来生成固定窗口的 watermark。 */
   public final long windowOutOfOrdernessMillis;
+
   /** 输入分区空闲这么久后推进 watermark，避免一条静默分区把窗口一直关不上。 */
   public final long windowIdleMillis;
+
   /** 固定窗口快照里保留的最低分，含本数。0 表示现有规则打出来的信号都保留。 */
   public final double windowMinScore;
+
   public final long kafkaTransactionTimeoutMs;
   public final LocalDate firstTarget;
   public Map<String, Object> fleetSnapshots = Collections.emptyMap();
@@ -44,6 +56,21 @@ public final class MiningConfig implements Serializable {
     minCount = integer("min.count", 2);
     maxSignals = integer("max.signals", 200);
     retentionDays = integer("retention.days", 14);
+    flushMaxEvents = integer("flush.max.events", 2000);
+    flushMaxMillis = parseLong("flush.max.ms", 100L);
+    checkpointMinPauseMillis = parseLong("checkpoint.min.pause.ms", 10000L);
+    checkpointAlignedTimeoutMillis = parseLong("checkpoint.aligned.timeout.ms", 10000L);
+    String unaligned = get("checkpoint.unaligned.enabled", "true").trim();
+    if (!unaligned.equals("true") && !unaligned.equals("false")) {
+      throw new IllegalArgumentException("checkpoint.unaligned.enabled must be true or false");
+    }
+    checkpointUnaligned = Boolean.parseBoolean(unaligned);
+    if (flushMaxEvents < 1
+        || flushMaxMillis < 1
+        || checkpointMinPauseMillis < 0
+        || checkpointAlignedTimeoutMillis < 0) {
+      throw new IllegalArgumentException("Invalid flush or checkpoint flow bounds");
+    }
     emitMillis = integer("emit.interval.ms", 1000);
     latenessMillis = integer("allowed.lateness.ms", 600000);
     windowSizeMillis = parseLong("window.size.ms", 300000L);
@@ -63,9 +90,10 @@ public final class MiningConfig implements Serializable {
         || emitMillis < 1
         || latenessMillis < 0
         || kafkaTransactionTimeoutMs
-            <= (long) integer("checkpoint.interval.ms", 5000) + integer("checkpoint.timeout.ms", 120000)) {
+            <= Math.max((long) integer("checkpoint.interval.ms", 5000), checkpointMinPauseMillis)
+                + integer("checkpoint.timeout.ms", 120000)) {
       throw new IllegalArgumentException(
-          "Invalid mining bounds, or kafka.transaction.timeout.ms does not exceed checkpoint.interval.ms + checkpoint.timeout.ms");
+          "Invalid mining bounds, or kafka.transaction.timeout.ms does not exceed max(checkpoint.interval.ms, checkpoint.min.pause.ms) + checkpoint.timeout.ms");
     }
     if (windowSizeMillis < 1000
         || windowOutOfOrdernessMillis < 0
@@ -94,9 +122,7 @@ public final class MiningConfig implements Serializable {
     }
   }
 
-  /**
-   * 未配置时取启动当日减 3 天，时区固定 +08:00。显式日期优先。该值在进程启动时确定，运行中不随墙钟前移。
-   */
+  /** 未配置时取启动当日减 3 天，时区固定 +08:00。显式日期优先。该值在进程启动时确定，运行中不随墙钟前移。 */
   private LocalDate resolveFirstTarget() {
     String configured = get("target.start.date", "").trim();
     if (configured.isEmpty()) {

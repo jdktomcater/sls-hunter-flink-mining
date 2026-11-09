@@ -2,6 +2,7 @@ package com.sls.hunter.flink;
 
 import java.nio.charset.StandardCharsets;
 import java.time.DateTimeException;
+import java.time.Duration;
 import java.time.LocalDate;
 import java.util.Arrays;
 import java.util.Collections;
@@ -32,8 +33,8 @@ import org.slf4j.LoggerFactory;
 /**
  * Kafka 作业入口。按索引族分区计算。完整性来自同一分区里的 SEAL，不使用 watermark 推断来源已经到齐。
  *
- * <p>结果、非法输入和超出在线保留期的事件分三个 Kafka 事务 sink 写出。{@code jdbc.enabled=true}
- * 时，结果快照再按窗口 upsert 到 PostgreSQL。
+ * <p>结果、非法输入和超出在线保留期的事件分三个 Kafka 事务 sink 写出。{@code jdbc.enabled=true} 时，结果快照再按窗口 upsert 到
+ * PostgreSQL。
  */
 public final class MiningJob {
   private static final Logger LOG = LoggerFactory.getLogger(MiningJob.class);
@@ -66,7 +67,7 @@ public final class MiningJob {
         config.integer("checkpoint.interval.ms", 5000), CheckpointingMode.EXACTLY_ONCE);
     env.getCheckpointConfig().setCheckpointStorage(config.required("checkpoint.storage"));
     env.getCheckpointConfig().setCheckpointTimeout(config.integer("checkpoint.timeout.ms", 120000));
-    env.getCheckpointConfig().setMaxConcurrentCheckpoints(1);
+    configureCheckpointFlow(env.getCheckpointConfig(), config);
     env.getCheckpointConfig()
         .enableExternalizedCheckpoints(
             CheckpointConfig.ExternalizedCheckpointCleanup.RETAIN_ON_CANCELLATION);
@@ -87,8 +88,7 @@ public final class MiningJob {
         env.fromSource(source, WatermarkStrategy.<SourcedRecord>noWatermarks(), "mining-input")
             .uid("mining-input-v1")
             .process(
-                new Parse(
-                    config.integer("max.future.skew.ms", 300000), config.topicFamilies()))
+                new Parse(config.integer("max.future.skew.ms", 300000), config.topicFamilies()))
             .name("validate-input")
             .uid("validate-input-v1");
     SingleOutputStreamOperator<String> results =
@@ -115,6 +115,7 @@ public final class MiningJob {
           table);
       results
           .addSink(PostgresSnapshotSink.create(config))
+          .disableChaining()
           .name("mining-window-jdbc")
           .uid("signal-jdbc-v1");
     } else {
@@ -133,6 +134,20 @@ public final class MiningJob {
         writePostgres ? "enabled" : "disabled");
     env.execute(config.get("job.name", "sls-hunter-flink-mining"));
     LOG.info("Mining job execution completed");
+  }
+
+  /** 非对齐只解决网络反压；算子回调本身仍需及时让出任务线程。 */
+  static void configureCheckpointFlow(CheckpointConfig checkpoint, MiningConfig config) {
+    checkpoint.setMaxConcurrentCheckpoints(1);
+    checkpoint.setMinPauseBetweenCheckpoints(config.checkpointMinPauseMillis);
+    checkpoint.enableUnalignedCheckpoints(config.checkpointUnaligned);
+    checkpoint.setAlignedCheckpointTimeout(
+        Duration.ofMillis(config.checkpointAlignedTimeoutMillis));
+    LOG.info(
+        "Checkpoint flow: minPauseMillis={}, unaligned={}, alignedTimeoutMillis={}",
+        config.checkpointMinPauseMillis,
+        config.checkpointUnaligned,
+        config.checkpointAlignedTimeoutMillis);
   }
 
   /** 能解析、且没有越过允许时钟偏差的记录才进入主流程。 */
@@ -155,10 +170,9 @@ public final class MiningJob {
       Event event = null;
       try {
         event =
-            Event.parse(
-                record.value, record.topic, record.partition, record.offset, topicFamilies);
+            Event.parse(record.value, record.topic, record.partition, record.offset, topicFamilies);
         rejectTooFarAhead(event);
-        LOG.info(
+        LOG.debug(
             "Input accepted: topic={}, partition={}, offset={}, family={}, kind={}, day={}, id={}",
             record.topic,
             record.partition,
@@ -210,13 +224,10 @@ public final class MiningJob {
     }
   }
 
-  /**
-   * 有 family 时用它做 Kafka key。固定窗口再带上 window_start，按日快照仍用 target_day，同一种窗口才能覆盖旧版本。
-   */
+  /** 有 family 时用它做 Kafka key。固定窗口再带上 window_start，按日快照仍用 target_day，同一种窗口才能覆盖旧版本。 */
   static KafkaSink<String> sink(MiningConfig config, String topic, String suffix) {
     Properties props = config.kafkaProperties();
-    props.setProperty(
-        "transaction.timeout.ms", Long.toString(config.kafkaTransactionTimeoutMs));
+    props.setProperty("transaction.timeout.ms", Long.toString(config.kafkaTransactionTimeoutMs));
     props.setProperty("linger.ms", config.get("kafka.linger.ms", "5"));
     return KafkaSink.<String>builder()
         .setBootstrapServers(config.required("kafka.bootstrap.servers"))
@@ -237,7 +248,7 @@ public final class MiningJob {
                         ? body.getOrDefault("target_day", "").toString()
                         : windowStart.toString();
                 String key = body.getOrDefault("index_family", "") + ":" + windowKey;
-                LOG.info(
+                LOG.debug(
                     "Record serialized for Kafka sink (commit pending): sink={}, topic={}, key={}, chars={}",
                     suffix,
                     topic,
@@ -274,7 +285,7 @@ public final class MiningJob {
     @Override
     public void deserialize(ConsumerRecord<byte[], byte[]> record, Collector<SourcedRecord> out) {
       byte[] payload = record.value();
-      LOG.info(
+      LOG.debug(
           "Kafka record received: topic={}, partition={}, offset={}, keyBytes={}, valueBytes={}",
           record.topic(),
           record.partition(),

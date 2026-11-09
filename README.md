@@ -61,6 +61,8 @@ java -cp target/sls-hunter-flink-mining-1.0.0-SNAPSHOT.jar \
 
 状态为 Flink 托管状态（JSON schema v1），包括日桶、去重身份、上次快照、修订号和定时器。固定 operator UID/maxParallelism；升级从 Savepoint 恢复，不跳过旧状态。持久化 checkpoint 路径和 transaction prefix 必须按环境配置。
 
+`MiningJob` checkpoint 超时的配置、优化边界与上线验证见 [checkpoint 排查说明](docs/checkpoint-tuning.md)。
+
 ## 固定时间窗口
 
 `WindowMiningJob` 与按日作业并行，单独的消费组读同一份输入。窗口是按事件时间对齐到 Unix 纪元的滚动窗口，默认 5 分钟（`window.size.ms`）。窗口内命令走 `MiningEngine` 在 `history.compare=false` 时的命令结构规则和 Linux 行为规则，不把空基线当成新增。`history.compare=true` 时作业直接拒绝启动。

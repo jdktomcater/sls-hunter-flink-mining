@@ -30,8 +30,8 @@ import org.slf4j.LoggerFactory;
 /**
  * 一个索引族一个键。族内的日桶、快照、修订号和定时器都在托管状态里，一次刷新统一计算该族所有就绪日期。
  *
- * <p>输出是整日快照而不是单条告警。{@code PROVISIONAL} 表示目标日尚未过完迟到期；封账且过了迟到期后为 {@code FINAL}；
- * 其后内容再变则为 {@code CORRECTED}。
+ * <p>输出是整日快照而不是单条告警。{@code PROVISIONAL} 表示目标日尚未过完迟到期；封账且过了迟到期后为 {@code FINAL}； 其后内容再变则为 {@code
+ * CORRECTED}。
  */
 public class MiningProcessFunction extends KeyedProcessFunction<String, Event, String> {
   private static final Logger LOG = LoggerFactory.getLogger(MiningProcessFunction.class);
@@ -65,11 +65,14 @@ public class MiningProcessFunction extends KeyedProcessFunction<String, Event, S
     revisions =
         getRuntimeContext()
             .getMapState(
-                new MapStateDescriptor<String, Long>("snapshot-revision-v1", String.class, Long.class));
+                new MapStateDescriptor<String, Long>(
+                    "snapshot-revision-v1", String.class, Long.class));
     highDay =
-        getRuntimeContext().getState(new ValueStateDescriptor<String>("highest-day-v1", String.class));
+        getRuntimeContext()
+            .getState(new ValueStateDescriptor<String>("highest-day-v1", String.class));
     pendingTimer =
-        getRuntimeContext().getState(new ValueStateDescriptor<Long>("pending-timer-v1", Long.class));
+        getRuntimeContext()
+            .getState(new ValueStateDescriptor<Long>("pending-timer-v1", Long.class));
   }
 
   private <T> MapState<String, T> mapState(String name, Class<T> valueClass) throws Exception {
@@ -109,6 +112,7 @@ public class MiningProcessFunction extends KeyedProcessFunction<String, Event, S
       ctx.output(LATE, Json.write(Json.obj("reason", "outside_online_retention", "event", event)));
       return;
     }
+    boolean retentionAdvanced = highest == null || day.isAfter(top);
     if (day.isAfter(top)) {
       top = day;
       highDay.update(event.day);
@@ -120,7 +124,7 @@ public class MiningProcessFunction extends KeyedProcessFunction<String, Event, S
     String pendingKey = Json.write(J8.list(event.day, event.kind, event.id));
     boolean replacedPending = pendingEvents.contains(pendingKey);
     pendingEvents.put(pendingKey, Json.write(event));
-    LOG.info(
+    LOG.debug(
         "Input buffered: family={}, kind={}, day={}, id={}, highestDay={}, replacedPending={}",
         ctx.getCurrentKey(),
         event.kind,
@@ -130,9 +134,12 @@ public class MiningProcessFunction extends KeyedProcessFunction<String, Event, S
         replacedPending);
     // 保留窗口跟着已观察到的最新业务日走，不跟墙钟，历史回放才不会刚读入就被清掉。
     List<String> expired = new ArrayList<>();
-    for (String storedDay : buckets.keys()) {
-      if (LocalDate.parse(storedDay).isBefore(retentionStart(top))) {
-        expired.add(storedDay);
+    if (retentionAdvanced) {
+      LocalDate cutoff = retentionStart(top);
+      for (String storedDay : buckets.keys()) {
+        if (LocalDate.parse(storedDay).isBefore(cutoff)) {
+          expired.add(storedDay);
+        }
       }
     }
     for (String storedDay : expired) {
@@ -142,8 +149,7 @@ public class MiningProcessFunction extends KeyedProcessFunction<String, Event, S
       fleetOverrides.remove(storedDay);
     }
     if (!expired.isEmpty()) {
-      LOG.info(
-          "Expired day state removed: family={}, days={}", ctx.getCurrentKey(), expired);
+      LOG.info("Expired day state removed: family={}, days={}", ctx.getCurrentKey(), expired);
     }
     schedule(ctx.timerService(), ctx.getCurrentKey());
   }
@@ -153,9 +159,7 @@ public class MiningProcessFunction extends KeyedProcessFunction<String, Event, S
     return newest.minusDays(config.retentionDays - 1L);
   }
 
-  /**
-   * 登记下一次处理时间定时器。已有更早的定时器时保持不动，因此封账定时器不会被随后的事件推迟，连续事件也不会把批次一直往后推。
-   */
+  /** 登记下一次处理时间定时器。已有更早的定时器时保持不动，因此封账定时器不会被随后的事件推迟，连续事件也不会把批次一直往后推。 */
   private void schedule(TimerService timers, String family) throws Exception {
     scheduleAt(timers, family, timers.currentProcessingTime() + config.emitMillis, "flush");
   }
@@ -181,17 +185,36 @@ public class MiningProcessFunction extends KeyedProcessFunction<String, Event, S
   @Override
   public void onTimer(long timestamp, OnTimerContext ctx, Collector<String> out) throws Exception {
     long started = System.nanoTime();
-    LOG.info(
-        "Mining flush started: family={}, processingTime={}", ctx.getCurrentKey(), timestamp);
+    LOG.info("Mining flush started: family={}, processingTime={}", ctx.getCurrentKey(), timestamp);
     pendingTimer.clear();
-    Map<String, DayBucket> touched = drainPending(ctx);
+    List<String> drainedKeys = new ArrayList<>();
+    Map<String, DayBucket> touched = drainPending(ctx, drainedKeys);
     for (Map.Entry<String, DayBucket> entry : touched.entrySet()) {
       buckets.put(entry.getKey(), Json.write(entry.getValue()));
     }
-    pendingEvents.clear();
+    // 日桶和对应待处理项的删除在同一回调完成，checkpoint 不会看到半个批次。
+    for (String key : drainedKeys) {
+      pendingEvents.remove(key);
+    }
+    if (!pendingEvents.isEmpty()) {
+      scheduleAt(
+          ctx.timerService(),
+          ctx.getCurrentKey(),
+          ctx.timerService().currentProcessingTime() + 1,
+          "continue-flush");
+      LOG.info(
+          "Mining flush yielded: family={}, drained={}, elapsedMillis={}",
+          ctx.getCurrentKey(),
+          drainedKeys.size(),
+          (System.nanoTime() - started) / 1_000_000);
+      return;
+    }
     Map<String, DayBucket> days = new TreeMap<>();
     for (Map.Entry<String, String> entry : buckets.entries()) {
-      days.put(entry.getKey(), Json.MAPPER.readValue(entry.getValue(), DayBucket.class));
+      DayBucket updated = touched.get(entry.getKey());
+      days.put(
+          entry.getKey(),
+          updated == null ? Json.MAPPER.readValue(entry.getValue(), DayBucket.class) : updated);
     }
     long nextFinal = publishReadyDays(timestamp, ctx, out, days);
     if (nextFinal != Long.MAX_VALUE && nextFinal > timestamp) {
@@ -206,14 +229,22 @@ public class MiningProcessFunction extends KeyedProcessFunction<String, Event, S
   }
 
   /** 把待处理事件折进各自的日桶。刷新时已经滑出保留窗口的事件改送迟到侧输出。 */
-  private Map<String, DayBucket> drainPending(OnTimerContext ctx) throws Exception {
+  private Map<String, DayBucket> drainPending(OnTimerContext ctx, List<String> drainedKeys)
+      throws Exception {
     Map<String, DayBucket> touched = new TreeMap<>();
     String highest = highDay.value();
     LocalDate cutoff = highest == null ? LocalDate.MIN : retentionStart(LocalDate.parse(highest));
     int processed = 0, accepted = 0, skipped = 0, late = 0, seals = 0;
-    for (String raw : pendingEvents.values()) {
+    long started = System.nanoTime();
+    for (Map.Entry<String, String> pending : pendingEvents.entries()) {
+      if (processed >= config.flushMaxEvents
+          || (processed > 0
+              && (System.nanoTime() - started) / 1_000_000 >= config.flushMaxMillis)) {
+        break;
+      }
       processed++;
-      Event event = Json.MAPPER.readValue(raw, Event.class);
+      drainedKeys.add(pending.getKey());
+      Event event = Json.MAPPER.readValue(pending.getValue(), Event.class);
       if (LocalDate.parse(event.day).isBefore(cutoff)) {
         late++;
         LOG.info(
@@ -224,7 +255,8 @@ public class MiningProcessFunction extends KeyedProcessFunction<String, Event, S
             event.id,
             cutoff);
         ctx.output(
-            LATE, Json.write(Json.obj("reason", "outside_online_retention_at_flush", "event", event)));
+            LATE,
+            Json.write(Json.obj("reason", "outside_online_retention_at_flush", "event", event)));
         continue;
       }
       DayBucket bucket = touched.get(event.day);
@@ -250,14 +282,14 @@ public class MiningProcessFunction extends KeyedProcessFunction<String, Event, S
         seals++;
       } else if (bucket.identities.contains(event.id)) {
         skipped++;
-        LOG.info(
+        LOG.debug(
             "Input skipped: family={}, day={}, id={}, reason=duplicateIdentity",
             ctx.getCurrentKey(),
             event.day,
             event.id);
       } else if (bucket.add(event)) {
         accepted++;
-        LOG.info(
+        LOG.debug(
             "Input folded into day bucket: family={}, day={}, id={}, dayEvents={}, sealed={}",
             ctx.getCurrentKey(),
             event.day,
@@ -266,15 +298,19 @@ public class MiningProcessFunction extends KeyedProcessFunction<String, Event, S
             bucket.sealed);
       } else {
         skipped++;
-        LOG.info(
+        LOG.debug(
             "Input skipped: family={}, day={}, id={}, reason=dayEndSubsecond",
             ctx.getCurrentKey(),
             event.day,
             event.id);
       }
       if (bucket.identities.size() > config.integer("max.events.per.family.day", 2000000)) {
-        LOG.error("Daily identity capacity exceeded: family={}, day={}, identities={}, limit={}",
-            ctx.getCurrentKey(), event.day, bucket.identities.size(), config.integer("max.events.per.family.day", 2000000));
+        LOG.error(
+            "Daily identity capacity exceeded: family={}, day={}, identities={}, limit={}",
+            ctx.getCurrentKey(),
+            event.day,
+            bucket.identities.size(),
+            config.integer("max.events.per.family.day", 2000000));
         throw new IllegalStateException("Daily identity capacity exceeded");
       }
     }
@@ -296,9 +332,7 @@ public class MiningProcessFunction extends KeyedProcessFunction<String, Event, S
     return touched;
   }
 
-  /**
-   * 打开历史对比时，基线日都已封账且 fleet 就绪才计算。关掉后当天桶直接按规则筛选。目标日封账且过了结束时间加允许迟到，快照才是终态。内容没变且终态标志也没变时不重复下发。
-   */
+  /** 打开历史对比时，基线日都已封账且 fleet 就绪才计算。关掉后当天桶直接按规则筛选。目标日封账且过了结束时间加允许迟到，快照才是终态。内容没变且终态标志也没变时不重复下发。 */
   private long publishReadyDays(
       long timestamp, OnTimerContext ctx, Collector<String> out, Map<String, DayBucket> days)
       throws Exception {
@@ -414,10 +448,13 @@ public class MiningProcessFunction extends KeyedProcessFunction<String, Event, S
   }
 
   /** 状态里只存签名、状态和信号 id，不存整份快照。 */
-  private boolean unchanged(String day, MiningEngine.Result result, boolean complete) throws Exception {
+  private boolean unchanged(String day, MiningEngine.Result result, boolean complete)
+      throws Exception {
     String previous = outputs.get(day);
-    Map<String, Object> stored = previous == null ? Collections.<String, Object>emptyMap() : Json.map(previous);
-    boolean wasFinal = J8.set("FINAL", "CORRECTED").contains(stored.getOrDefault("status", "").toString());
+    Map<String, Object> stored =
+        previous == null ? Collections.<String, Object>emptyMap() : Json.map(previous);
+    boolean wasFinal =
+        J8.set("FINAL", "CORRECTED").contains(stored.getOrDefault("status", "").toString());
     String signature =
         Json.write(
             Json.obj(
@@ -440,8 +477,10 @@ public class MiningProcessFunction extends KeyedProcessFunction<String, Event, S
       boolean complete)
       throws Exception {
     String previous = outputs.get(day);
-    Map<String, Object> stored = previous == null ? Collections.<String, Object>emptyMap() : Json.map(previous);
-    boolean wasFinal = J8.set("FINAL", "CORRECTED").contains(stored.getOrDefault("status", "").toString());
+    Map<String, Object> stored =
+        previous == null ? Collections.<String, Object>emptyMap() : Json.map(previous);
+    boolean wasFinal =
+        J8.set("FINAL", "CORRECTED").contains(stored.getOrDefault("status", "").toString());
     String status = complete ? (wasFinal ? "CORRECTED" : "FINAL") : "PROVISIONAL";
     long revision = revisions.contains(day) ? revisions.get(day) + 1 : 1;
     revisions.put(day, revision);
@@ -469,7 +508,12 @@ public class MiningProcessFunction extends KeyedProcessFunction<String, Event, S
     String signature =
         Json.write(
             Json.obj(
-                "signals", result.signals(), "shallow_candidates", result.shallow(), "stats", result.stats()));
+                "signals",
+                result.signals(),
+                "shallow_candidates",
+                result.shallow(),
+                "stats",
+                result.stats()));
     out.collect(
         Json.write(
             Json.obj(
@@ -507,8 +551,15 @@ public class MiningProcessFunction extends KeyedProcessFunction<String, Event, S
                 result.stats())));
     outputs.put(
         day, Json.write(Json.obj("signature", signature, "status", status, "ids", currentIds)));
-    LOG.info("Snapshot emitted to downstream operator (Kafka commit pending): family={}, targetDay={}, revision={}, status={}, signals={}, shallowCandidates={}, deletedSignals={}",
-        family, day, revision, status, decorated.size(), result.shallow().size(), deleted.size());
+    LOG.info(
+        "Snapshot emitted to downstream operator (Kafka commit pending): family={}, targetDay={}, revision={}, status={}, signals={}, shallowCandidates={}, deletedSignals={}",
+        family,
+        day,
+        revision,
+        status,
+        decorated.size(),
+        result.shallow().size(),
+        deleted.size());
   }
 
   /** 身份哈希不含分数，同一实体重新打分后 id 保持不变。 */
