@@ -1,0 +1,516 @@
+{
+  "NETWORK_FETCH_PROCS": [
+    "curl.exe",
+    "curl",
+    "wget",
+    "wget.exe",
+    "bitsadmin.exe",
+    "bitsadmin",
+    "powershell.exe",
+    "powershell",
+    "pwsh.exe",
+    "pwsh"
+  ],
+  "RARE_GATEWAY_PROCS": [
+    "gost",
+    "gost.exe",
+    "frpc",
+    "frpc.exe",
+    "nssocks"
+  ],
+  "INTERPRETER_NAMES": [
+    "cmd.exe",
+    "cmd",
+    "powershell.exe",
+    "powershell",
+    "pwsh.exe",
+    "pwsh"
+  ],
+  "LOL_BIN_PROCS": [
+    "rundll32.exe",
+    "rundll32",
+    "mshta.exe",
+    "mshta",
+    "certutil.exe",
+    "certutil",
+    "regsvr32.exe",
+    "regsvr32",
+    "wscript.exe",
+    "wscript",
+    "cscript.exe",
+    "cscript"
+  ],
+  "ENTERPRISE_AGENT_PROCS": [
+    "mssys.exe",
+    "mssys",
+    "mskes.exe",
+    "mskes",
+    "mdua.exe",
+    "mdua"
+  ],
+  "DEV_TOOL_PROCS": [
+    "git.exe",
+    "git",
+    "git-remote-http.exe",
+    "git-remote-https.exe",
+    "runnerw.exe",
+    "runnerw64.exe",
+    "idea64.exe",
+    "webstorm64.exe",
+    "phpstorm64.exe",
+    "cursor.exe",
+    "code.exe"
+  ],
+  "_ALL_VENDOR_RULES": null,
+  "NEVER_WHITELIST_BASE": [
+    "curl",
+    "wget",
+    "ping",
+    "powershell",
+    "pwsh",
+    "bitsadmin",
+    "gost",
+    "frpc",
+    "nssocks",
+    "certutil",
+    "mshta",
+    "regsvr32",
+    "wscript",
+    "cscript"
+  ],
+  "WINDOWS_BUILTIN_BASE": [
+    "smss",
+    "csrss",
+    "wininit",
+    "services",
+    "lsass",
+    "svchost",
+    "dwm",
+    "logonui",
+    "winlogon",
+    "atbroker",
+    "schtasks",
+    "ngen",
+    "taskhostw",
+    "dllhost",
+    "msiexec",
+    "setup",
+    "find",
+    "locale",
+    "gpupdate",
+    "dsregcmd",
+    "mqsvc",
+    "wmiprvse",
+    "wmiapsrv",
+    "wmic",
+    "spoolsv",
+    "lsm",
+    "fontdrvhost",
+    "sihost",
+    "runtimebroker",
+    "searchindexer",
+    "conhost",
+    "audiodg",
+    "systemsettings",
+    "im-select",
+    "cat",
+    "nslookup",
+    "telnet",
+    "ipconfig",
+    "smartscreen",
+    "taskkill",
+    "net",
+    "elevation_service",
+    "bcdedit"
+  ],
+  "VENDOR_RULES": [
+    {
+      "bases": [
+        "chrome"
+      ],
+      "markers": [
+        "google\\chrome\\application\\chrome.exe"
+      ],
+      "id": "vendor_google_chrome"
+    },
+    {
+      "bases": [
+        "iexplore"
+      ],
+      "markers": [
+        "internet explorer\\iexplore.exe",
+        "program files\\internet explorer\\"
+      ],
+      "id": "vendor_ie"
+    },
+    {
+      "bases": [
+        "updater"
+      ],
+      "markers": [
+        "google\\googleupdater\\"
+      ],
+      "id": "vendor_google_updater"
+    },
+    {
+      "bases": [
+        "microsoftedgeupdate"
+      ],
+      "markers": [
+        "microsoft\\edgeupdate\\",
+        "edgeupdate\\microsoftedgeupdate",
+        "microsoft edge update\\",
+        "edgeupdate.exe"
+      ],
+      "id": "vendor_edge_update"
+    },
+    {
+      "bases": [
+        "microsoftedge"
+      ],
+      "markers": [
+        "microsoft\\edge\\application\\"
+      ],
+      "id": "vendor_edge_browser"
+    },
+    {
+      "bases": [
+        "officeclicktorun",
+        "updatenotificationmgr"
+      ],
+      "markers": [
+        "microsoft shared\\clicktorun\\",
+        "microsoft\\edgewebview\\"
+      ],
+      "id": "vendor_office_clicktorun"
+    },
+    {
+      "bases": [
+        "ms-teams",
+        "msteams"
+      ],
+      "markers": [
+        "windowsapps\\msteams_",
+        "microsoft\\teams\\"
+      ],
+      "id": "vendor_ms_teams"
+    },
+    {
+      "bases": [
+        "sso browser"
+      ],
+      "markers": [
+        "ssobrowser\\sso browser.exe",
+        "sso browser\\sso browser.exe"
+      ],
+      "id": "vendor_sso_browser"
+    },
+    {
+      "bases": [
+        "slack"
+      ],
+      "markers": [
+        "slack\\app-",
+        "slack\\slack.exe"
+      ],
+      "id": "vendor_slack"
+    },
+    {
+      "bases": [
+        "telegram"
+      ],
+      "markers": [
+        "telegram desktop\\telegram.exe"
+      ],
+      "id": "vendor_telegram"
+    },
+    {
+      "bases": [
+        "cursor",
+        "code"
+      ],
+      "markers": [
+        "\\programs\\cursor\\",
+        "\\appdata\\local\\programs\\cursor\\"
+      ],
+      "id": "vendor_cursor"
+    },
+    {
+      "bases": [
+        "idea64",
+        "webstorm64",
+        "phpstorm64",
+        "runnerw",
+        "runnerw64"
+      ],
+      "markers": [
+        "jetbrains\\"
+      ],
+      "id": "vendor_jetbrains"
+    },
+    {
+      "bases": [
+        "git",
+        "git-remote-http",
+        "git-remote-https",
+        "sh",
+        "bash"
+      ],
+      "markers": [
+        "\\git\\",
+        "jetbrains\\",
+        "program files\\git\\"
+      ],
+      "id": "vendor_git_toolchain"
+    },
+    {
+      "bases": [
+        "node"
+      ],
+      "markers": [
+        "\\nodejs\\",
+        "\\npm\\",
+        "cursor\\",
+        "jetbrains\\"
+      ],
+      "id": "vendor_node_dev"
+    },
+    {
+      "bases": [
+        "rg"
+      ],
+      "markers": [
+        "\\programs\\cursor\\",
+        "visual studio code\\"
+      ],
+      "id": "vendor_rg_dev"
+    },
+    {
+      "bases": [
+        "ngen"
+      ],
+      "markers": [
+        "\\microsoft.net\\framework"
+      ],
+      "id": "vendor_dotnet_ngen"
+    },
+    {
+      "bases": [
+        "msedgewebview2"
+      ],
+      "markers": [
+        "\\microsoft\\edgewebview\\application\\"
+      ],
+      "id": "vendor_edge_webview2"
+    },
+    {
+      "bases": [
+        "ssrecagent"
+      ],
+      "markers": [
+        "citrix\\sessionrecording\\"
+      ],
+      "id": "vendor_citrix_recording"
+    }
+  ],
+  "ASSETS_VENDOR_SPECS": [
+    [
+      [
+        "aliaqsinstall"
+      ],
+      [
+        "programdata\\aliaqsinstall",
+        "windows\\system32\\aliaqsinstall"
+      ],
+      "assets_fasoo_aegis_installer"
+    ],
+    [
+      [
+        "cwainstaller"
+      ],
+      [
+        "citrix\\citrix workspace",
+        "citrix\\workspace"
+      ],
+      "assets_citrix_workspace_installer"
+    ],
+    [
+      [
+        "compile"
+      ],
+      [
+        "\\go\\pkg\\tool\\windows_",
+        "\\go2\\pkg\\tool\\",
+        "\\gonew\\pkg\\tool\\"
+      ],
+      "assets_go_dev_compile"
+    ],
+    [
+      [
+        "keepass"
+      ],
+      [
+        "keepass password safe",
+        "keepassxc",
+        "program files\\keepass"
+      ],
+      "assets_keepass"
+    ],
+    [
+      [
+        "mysqld"
+      ],
+      [
+        "mysql-",
+        "-winx64\\bin\\mysqld",
+        "programdata\\mysql"
+      ],
+      "assets_mysql_local"
+    ],
+    [
+      [
+        "nvm"
+      ],
+      [
+        "\\nvm.exe",
+        "nvm4w"
+      ],
+      "assets_nvm_node"
+    ],
+    [
+      [
+        "java"
+      ],
+      [
+        "\\java\\jdk-",
+        "program files\\java\\jdk",
+        "program files (x86)\\java\\jdk"
+      ],
+      "assets_java_jdk"
+    ],
+    [
+      [
+        "virtualboxvm"
+      ],
+      [
+        "oracle\\virtualbox\\"
+      ],
+      "assets_virtualbox"
+    ],
+    [
+      [
+        "excel"
+      ],
+      [
+        "microsoft office\\root\\office",
+        "office16\\excel"
+      ],
+      "assets_office_excel"
+    ],
+    [
+      [
+        "ls",
+        "which",
+        "whoami"
+      ],
+      [
+        "\\git\\usr\\bin\\",
+        "\\programs\\git\\usr\\bin\\"
+      ],
+      "assets_git_msys_utils"
+    ],
+    [
+      [
+        "explorer"
+      ],
+      [
+        "\\windows\\explorer.exe"
+      ],
+      "assets_windows_explorer"
+    ],
+    [
+      [
+        "portablegit"
+      ],
+      [
+        "portablegit-",
+        ".7z.exe"
+      ],
+      "assets_portable_git_installer"
+    ],
+    [
+      [
+        "python"
+      ],
+      [
+        "\\anaconda3\\envs\\",
+        "documents\\env\\anaconda"
+      ],
+      "assets_anaconda_dev"
+    ],
+    [
+      [
+        "codex"
+      ],
+      [
+        "\\.vscode\\extensions\\openai.chatgpt",
+        "\\openai.chatgpt-",
+        "\\codex.exe"
+      ],
+      "assets_vscode_codex_extension"
+    ],
+    [
+      [
+        "wmic"
+      ],
+      [
+        "\\windows\\system32\\wbem\\wmic"
+      ],
+      "assets_wmic_system32"
+    ],
+    [
+      [
+        "net"
+      ],
+      [
+        "\\windows\\system32\\net.exe"
+      ],
+      "assets_net_system32"
+    ]
+  ],
+  "FASOO_REG_CMD_MARKERS": [
+    "currentversion\\run",
+    "cscc",
+    "fasoo"
+  ],
+  "CITRIX_RUNDLL_MARKERS": [
+    "picaaudiosupport.dll",
+    "mshtml.dll\",printhtml",
+    "mshtml.dll\",printhtml"
+  ],
+  "DEV_ENCODED_PS_MARKERS": [
+    "openai.chatgpt",
+    "codex.exe",
+    "\\vite\\bin\\vite.js",
+    "node_modules\\.bin\\\\vite"
+  ],
+  "ATTACK_TEST_CMD_MARKERS": [
+    "vssadmin  delete",
+    "vssadmin delete",
+    "wevtutil  cl",
+    "wevtutil cl",
+    "netsh advfirewall set allprofiles state off",
+    "regsvr32  /s /n /u /i:http",
+    "mshta   http://",
+    "sc  creat ",
+    "example.com/test.sct",
+    "example.com/test.hta",
+    "example.com/test.msi"
+  ],
+  "INTERNAL_FETCH_HOST_MARKERS": [
+    "172.30.82.110",
+    "127.0.0.1",
+    "localhost",
+    "/api/console/proxy"
+  ]
+}

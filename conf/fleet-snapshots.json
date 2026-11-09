@@ -1,0 +1,5 @@
+{
+  "tracing_sas_linux": {"2026-06-10": {"curl": 12, "bash": 80}},
+  "tracing_sas_win": {"2026-06-10": {"powershell.exe": 25}},
+  "tracing_sas_jumper": {"2026-06-10": {"ssh": 9}}
+}

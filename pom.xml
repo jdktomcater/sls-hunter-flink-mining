@@ -1,0 +1,91 @@
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion><groupId>com.sls.hunter</groupId><artifactId>sls-hunter-flink-mining</artifactId><version>1.0.0-SNAPSHOT</version>
+  <properties><maven.compiler.source>8</maven.compiler.source><maven.compiler.target>8</maven.compiler.target><project.build.sourceEncoding>UTF-8</project.build.sourceEncoding><flink.version>1.18.1</flink.version><kafka.connector.version>3.2.0-1.18</kafka.connector.version><jdbc.connector.version>3.2.0-1.18</jdbc.connector.version><postgresql.version>42.7.4</postgresql.version></properties>
+  <dependencyManagement><dependencies><dependency><groupId>com.fasterxml.jackson</groupId><artifactId>jackson-bom</artifactId><version>2.15.4</version><type>pom</type><scope>import</scope></dependency></dependencies></dependencyManagement>
+  <dependencies>
+    <dependency><groupId>org.slf4j</groupId><artifactId>slf4j-api</artifactId><version>1.7.36</version></dependency>
+    <dependency><groupId>org.apache.flink</groupId><artifactId>flink-connector-base</artifactId><version>${flink.version}</version></dependency>
+    <dependency><groupId>org.apache.flink</groupId><artifactId>flink-streaming-java</artifactId><version>${flink.version}</version><scope>provided</scope></dependency>
+    <dependency><groupId>org.apache.flink</groupId><artifactId>flink-clients</artifactId><version>${flink.version}</version><scope>provided</scope></dependency>
+    <dependency><groupId>org.apache.flink</groupId><artifactId>flink-statebackend-rocksdb</artifactId><version>${flink.version}</version><scope>provided</scope></dependency>
+    <dependency><groupId>org.apache.flink</groupId><artifactId>flink-connector-kafka</artifactId><version>${kafka.connector.version}</version></dependency>
+    <dependency><groupId>org.apache.flink</groupId><artifactId>flink-connector-jdbc</artifactId><version>${jdbc.connector.version}</version></dependency>
+    <dependency><groupId>org.postgresql</groupId><artifactId>postgresql</artifactId><version>${postgresql.version}</version></dependency>
+    <dependency><groupId>com.fasterxml.jackson.core</groupId><artifactId>jackson-databind</artifactId><version>2.15.4</version></dependency>
+    <dependency><groupId>org.apache.flink</groupId><artifactId>flink-streaming-java</artifactId><version>${flink.version}</version><type>test-jar</type><scope>test</scope></dependency>
+    <dependency><groupId>org.apache.flink</groupId><artifactId>flink-test-utils</artifactId><version>${flink.version}</version><scope>test</scope></dependency>
+    <dependency><groupId>org.junit.jupiter</groupId><artifactId>junit-jupiter</artifactId><version>5.10.2</version><scope>test</scope></dependency>
+  </dependencies>
+  <build>
+  <resources>
+    <resource><directory>src/main/resources</directory></resource>
+    <resource><directory>conf</directory><includes><include>mining.properties</include><include>window-mining.properties</include><include>fleet-snapshots.json</include></includes></resource>
+  </resources>
+  <plugins>
+    <plugin><groupId>com.diffplug.spotless</groupId><artifactId>spotless-maven-plugin</artifactId><version>2.43.0</version><configuration><java><googleJavaFormat><version>1.24.0</version></googleJavaFormat></java></configuration></plugin>
+    <plugin><groupId>org.apache.maven.plugins</groupId><artifactId>maven-compiler-plugin</artifactId><version>3.13.0</version></plugin>
+    <plugin><groupId>org.apache.maven.plugins</groupId><artifactId>maven-surefire-plugin</artifactId><version>3.5.2</version></plugin>
+    <plugin>
+      <groupId>org.apache.maven.plugins</groupId>
+      <artifactId>maven-jar-plugin</artifactId>
+      <version>3.4.1</version>
+      <configuration>
+        <!-- Shade replaces the main artifact; always rebuild the thin JAR before shading. -->
+        <forceCreation>true</forceCreation>
+      </configuration>
+    </plugin>
+    <plugin>
+      <groupId>org.apache.maven.plugins</groupId>
+      <artifactId>maven-shade-plugin</artifactId>
+      <version>3.5.1</version>
+      <executions>
+        <execution>
+          <phase>package</phase>
+          <goals><goal>shade</goal></goals>
+          <configuration>
+            <createDependencyReducedPom>false</createDependencyReducedPom>
+            <artifactSet><excludes><exclude>org.apache.kafka:kafka-clients</exclude></excludes></artifactSet>
+            <relocations>
+              <relocation>
+                <pattern>com.fasterxml.jackson</pattern>
+                <shadedPattern>com.sls.hunter.shaded.jackson</shadedPattern>
+              </relocation>
+            </relocations>
+            <filters>
+              <filter>
+                <artifact>*:*</artifact>
+                <excludes>
+                  <!-- ManifestResourceTransformer generates the final application manifest. -->
+                  <exclude>META-INF/MANIFEST.MF</exclude>
+                  <exclude>META-INF/*.SF</exclude>
+                  <exclude>META-INF/*.RSA</exclude>
+                  <exclude>META-INF/*.DSA</exclude>
+                  <!-- The Java 8 Flink job runs on the classpath as a single shaded JAR. -->
+                  <exclude>module-info.class</exclude>
+                  <exclude>META-INF/versions/**/module-info.class</exclude>
+                  <exclude>org/apache/kafka/**</exclude>
+                </excludes>
+              </filter>
+            </filters>
+            <transformers>
+              <!-- Preserve every dependency's legal metadata instead of keeping only the first. -->
+              <transformer implementation="org.apache.maven.plugins.shade.resource.AppendingTransformer">
+                <resource>META-INF/LICENSE</resource>
+              </transformer>
+              <transformer implementation="org.apache.maven.plugins.shade.resource.AppendingTransformer">
+                <resource>META-INF/NOTICE</resource>
+              </transformer>
+              <transformer implementation="org.apache.maven.plugins.shade.resource.AppendingTransformer">
+                <resource>META-INF/DEPENDENCIES</resource>
+              </transformer>
+              <transformer implementation="org.apache.maven.plugins.shade.resource.ServicesResourceTransformer"/>
+              <transformer implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
+                <mainClass>com.sls.hunter.flink.MiningJob</mainClass>
+              </transformer>
+            </transformers>
+          </configuration>
+        </execution>
+      </executions>
+    </plugin>
+  </plugins></build>
+</project>

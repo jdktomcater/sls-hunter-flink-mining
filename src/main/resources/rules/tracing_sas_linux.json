@@ -1,0 +1,523 @@
+{
+  "NETWORK_FETCH_PROCS": [
+    "curl",
+    "wget",
+    "fetch"
+  ],
+  "RARE_GATEWAY_PROCS": [
+    "gost",
+    "frpc",
+    "frps",
+    "superproxy",
+    "ngrok",
+    "nssocks",
+    "chisel",
+    "earthworm",
+    "ew",
+    "lcx",
+    "reGeorg",
+    "neo-reGeorg",
+    "iodine",
+    "iodined",
+    "dnscat",
+    "dnscat2",
+    "dns2tcp",
+    "dns2tcpd",
+    "ncat",
+    "socat",
+    "msfconsole",
+    "meterpreter"
+  ],
+  "INTERPRETER_NAMES": [
+    "bash",
+    "sh",
+    "dash",
+    "zsh",
+    "ksh"
+  ],
+  "BEHAVIOR_PATTERNS": [
+    {
+      "label": "cron_persistence",
+      "description": "Crontab 写入或 /etc/cron.d 文件投放",
+      "severity": "high",
+      "query": {
+        "bool": {
+          "should": [
+            {
+              "wildcard": {
+                "cmdline": "*crontab -e*"
+              }
+            },
+            {
+              "wildcard": {
+                "cmdline": "*crontab -*l*"
+              }
+            },
+            {
+              "wildcard": {
+                "cmdline": "*/etc/cron*"
+              }
+            },
+            {
+              "wildcard": {
+                "cmdline": "*/var/spool/cron*"
+              }
+            },
+            {
+              "wildcard": {
+                "cmdline": "*echo*>>*/etc/cron*"
+              }
+            },
+            {
+              "wildcard": {
+                "cmdline": "*echo*>>/var/spool/cron*"
+              }
+            }
+          ],
+          "minimum_should_match": 1
+        }
+      },
+      "exclude_chains": [
+        "anacron",
+        "run-parts",
+        "logrotate",
+        "yum",
+        "apt"
+      ]
+    },
+    {
+      "label": "dns_tunnel_tool",
+      "description": "DNS 隧道工具进程 (iodine/dnscat2/dns2tcp)",
+      "severity": "critical",
+      "query": {
+        "bool": {
+          "should": [
+            {
+              "term": {
+                "proc_name.keyword": "iodine"
+              }
+            },
+            {
+              "term": {
+                "proc_name.keyword": "iodined"
+              }
+            },
+            {
+              "term": {
+                "proc_name.keyword": "dnscat"
+              }
+            },
+            {
+              "term": {
+                "proc_name.keyword": "dnscat2"
+              }
+            },
+            {
+              "term": {
+                "proc_name.keyword": "dns2tcp"
+              }
+            },
+            {
+              "term": {
+                "proc_name.keyword": "dns2tcpd"
+              }
+            },
+            {
+              "wildcard": {
+                "cmdline": "*dnscat*"
+              }
+            },
+            {
+              "wildcard": {
+                "cmdline": "*iodine*-f*"
+              }
+            },
+            {
+              "wildcard": {
+                "cmdline": "*dns2tcp*"
+              }
+            }
+          ],
+          "minimum_should_match": 1
+        }
+      }
+    },
+    {
+      "label": "dns_high_freq_suspicious",
+      "description": "nslookup/dig 高频查询可疑子域名模式",
+      "severity": "medium",
+      "query": {
+        "bool": {
+          "must": [
+            {
+              "terms": {
+                "proc_name.keyword": [
+                  "nslookup",
+                  "dig",
+                  "host"
+                ]
+              }
+            }
+          ]
+        }
+      },
+      "post_filter": "_dns_tunnel_heuristic",
+      "min_count_threshold": 50
+    },
+    {
+      "label": "credential_harvest",
+      "description": "读取 SSH 密钥 / shadow / 敏感凭证文件",
+      "severity": "high",
+      "query": {
+        "bool": {
+          "should": [
+            {
+              "wildcard": {
+                "cmdline": "*/.ssh/id_rsa*"
+              }
+            },
+            {
+              "wildcard": {
+                "cmdline": "*/.ssh/id_ed25519*"
+              }
+            },
+            {
+              "wildcard": {
+                "cmdline": "*/.ssh/authorized_keys*"
+              }
+            },
+            {
+              "wildcard": {
+                "cmdline": "*/etc/shadow*"
+              }
+            },
+            {
+              "wildcard": {
+                "cmdline": "*/.ssh/known_hosts*"
+              }
+            },
+            {
+              "wildcard": {
+                "cmdline": "*find*/.ssh*"
+              }
+            },
+            {
+              "wildcard": {
+                "cmdline": "*find*id_rsa*"
+              }
+            },
+            {
+              "wildcard": {
+                "cmdline": "*cat*/etc/shadow*"
+              }
+            }
+          ],
+          "minimum_should_match": 1
+        }
+      },
+      "exclude_procs": [
+        "sshd",
+        "puppet",
+        "ansible",
+        "salt-minion"
+      ]
+    },
+    {
+      "label": "ssh_lateral_novel_target",
+      "description": "SSH/SCP/rsync 到基线期间未见的内网目标",
+      "severity": "high",
+      "query": {
+        "bool": {
+          "must": [
+            {
+              "terms": {
+                "proc_name.keyword": [
+                  "ssh",
+                  "scp",
+                  "rsync",
+                  "sftp"
+                ]
+              }
+            }
+          ]
+        }
+      },
+      "post_filter": "_lateral_novel_dst"
+    },
+    {
+      "label": "reverse_shell",
+      "description": "反弹 Shell 模式 (bash -i, /dev/tcp, mkfifo, nc -e)",
+      "severity": "critical",
+      "query": {
+        "bool": {
+          "should": [
+            {
+              "wildcard": {
+                "cmdline": "*bash -i*>& /dev/tcp*"
+              }
+            },
+            {
+              "wildcard": {
+                "cmdline": "*/dev/tcp/*"
+              }
+            },
+            {
+              "wildcard": {
+                "cmdline": "*mkfifo*/tmp/*"
+              }
+            },
+            {
+              "wildcard": {
+                "cmdline": "*nc*-e*/bin/*"
+              }
+            },
+            {
+              "wildcard": {
+                "cmdline": "*ncat*-e*/bin/*"
+              }
+            },
+            {
+              "wildcard": {
+                "cmdline": "*socat*exec*"
+              }
+            },
+            {
+              "wildcard": {
+                "cmdline": "*python*socket*connect*"
+              }
+            },
+            {
+              "wildcard": {
+                "cmdline": "*perl*socket*"
+              }
+            },
+            {
+              "wildcard": {
+                "cmdline": "*ruby*TCPSocket*"
+              }
+            }
+          ],
+          "minimum_should_match": 1
+        }
+      }
+    },
+    {
+      "label": "port_listen_bind",
+      "description": "端口监听/Bind Shell (nc -l, socat LISTEN, python http.server)",
+      "severity": "high",
+      "query": {
+        "bool": {
+          "should": [
+            {
+              "wildcard": {
+                "cmdline": "*nc*-l*"
+              }
+            },
+            {
+              "wildcard": {
+                "cmdline": "*ncat*-l*"
+              }
+            },
+            {
+              "wildcard": {
+                "cmdline": "*socat*TCP-LISTEN*"
+              }
+            },
+            {
+              "wildcard": {
+                "cmdline": "*python*http.server*"
+              }
+            },
+            {
+              "wildcard": {
+                "cmdline": "*python*SimpleHTTPServer*"
+              }
+            },
+            {
+              "wildcard": {
+                "cmdline": "*python*-m*http*"
+              }
+            }
+          ],
+          "minimum_should_match": 1
+        }
+      },
+      "exclude_chains": [
+        "docker",
+        "kubelet",
+        "containerd"
+      ]
+    },
+    {
+      "label": "security_disable",
+      "description": "关闭安全防护 (SELinux/firewall/iptables 放行)",
+      "severity": "high",
+      "query": {
+        "bool": {
+          "should": [
+            {
+              "wildcard": {
+                "cmdline": "*setenforce 0*"
+              }
+            },
+            {
+              "wildcard": {
+                "cmdline": "*firewall-cmd*--add-port*"
+              }
+            },
+            {
+              "wildcard": {
+                "cmdline": "*iptables*-A*ACCEPT*"
+              }
+            },
+            {
+              "wildcard": {
+                "cmdline": "*iptables*-I*ACCEPT*"
+              }
+            },
+            {
+              "wildcard": {
+                "cmdline": "*systemctl stop firewalld*"
+              }
+            },
+            {
+              "wildcard": {
+                "cmdline": "*systemctl disable firewalld*"
+              }
+            },
+            {
+              "wildcard": {
+                "cmdline": "*ufw disable*"
+              }
+            }
+          ],
+          "minimum_should_match": 1
+        }
+      }
+    },
+    {
+      "label": "tunnel_proxy",
+      "description": "隧道/代理工具 (ssh -R/-L/-D, chisel, frpc, ew, reGeorg)",
+      "severity": "critical",
+      "query": {
+        "bool": {
+          "should": [
+            {
+              "wildcard": {
+                "cmdline": "*ssh*-R *"
+              }
+            },
+            {
+              "wildcard": {
+                "cmdline": "*ssh*-L *"
+              }
+            },
+            {
+              "wildcard": {
+                "cmdline": "*ssh*-D *"
+              }
+            },
+            {
+              "term": {
+                "proc_name.keyword": "chisel"
+              }
+            },
+            {
+              "term": {
+                "proc_name.keyword": "frpc"
+              }
+            },
+            {
+              "term": {
+                "proc_name.keyword": "frps"
+              }
+            },
+            {
+              "term": {
+                "proc_name.keyword": "ew"
+              }
+            },
+            {
+              "term": {
+                "proc_name.keyword": "earthworm"
+              }
+            },
+            {
+              "wildcard": {
+                "cmdline": "*chisel*"
+              }
+            },
+            {
+              "wildcard": {
+                "cmdline": "*frpc*-c*"
+              }
+            },
+            {
+              "wildcard": {
+                "cmdline": "*reGeorg*"
+              }
+            },
+            {
+              "wildcard": {
+                "cmdline": "*neo-reGeorg*"
+              }
+            }
+          ],
+          "minimum_should_match": 1
+        }
+      }
+    },
+    {
+      "label": "data_exfil",
+      "description": "数据外传模式 (tar+curl, base64 pipe, /dev/tcp 传文件)",
+      "severity": "high",
+      "query": {
+        "bool": {
+          "should": [
+            {
+              "wildcard": {
+                "cmdline": "*tar*|*curl*"
+              }
+            },
+            {
+              "wildcard": {
+                "cmdline": "*base64*|*curl*"
+              }
+            },
+            {
+              "wildcard": {
+                "cmdline": "*cat*|*nc *"
+              }
+            },
+            {
+              "wildcard": {
+                "cmdline": "*> /dev/tcp*"
+              }
+            },
+            {
+              "wildcard": {
+                "cmdline": "*curl*-T *"
+              }
+            },
+            {
+              "wildcard": {
+                "cmdline": "*curl*--upload*"
+              }
+            },
+            {
+              "wildcard": {
+                "cmdline": "*scp*@*:*"
+              }
+            }
+          ],
+          "minimum_should_match": 1
+        }
+      },
+      "exclude_procs": [
+        "rsync",
+        "ansible",
+        "puppet"
+      ]
+    }
+  ]
+}

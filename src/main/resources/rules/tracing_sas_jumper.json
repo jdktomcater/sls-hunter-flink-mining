@@ -1,0 +1,176 @@
+{
+  "NETWORK_FETCH_PROCS": [
+    "curl",
+    "wget",
+    "fetch"
+  ],
+  "RARE_GATEWAY_PROCS": [
+    "gost",
+    "frpc",
+    "superproxy",
+    "ngrok",
+    "nssocks"
+  ],
+  "INTERPRETER_NAMES": [
+    "bash",
+    "sh",
+    "dash",
+    "zsh",
+    "ksh"
+  ],
+  "NEVER_WHITELIST_PROCS": [
+    "bash",
+    "sh",
+    "dash",
+    "zsh",
+    "ksh",
+    "nc",
+    "ncat",
+    "perl",
+    "ruby",
+    "nmap",
+    "telnet"
+  ],
+  "FETCH_PROCS": [
+    "curl",
+    "wget",
+    "fetch"
+  ],
+  "INTERPRETER_PROCS": [
+    "python",
+    "python3"
+  ],
+  "JUMPSERVER_STACK": [
+    "gunicorn",
+    "celery",
+    "uvicorn",
+    "python3.11",
+    "python3",
+    "python"
+  ],
+  "CONTAINER_RUNTIME": [
+    "containerd-shim-runc-v2",
+    "containerd-shim",
+    "containerd",
+    "dockerd",
+    "runc",
+    "docker-compose",
+    "docker",
+    "docker-proxy"
+  ],
+  "CRON_MAINT": [
+    "crond",
+    "anacron",
+    "run-parts",
+    "basename",
+    "cat",
+    "sleep",
+    "systemd",
+    "agetty",
+    "grep"
+  ],
+  "MONITORING": [
+    "java",
+    "redis-server",
+    "redis-sentinel",
+    "logstash",
+    "check"
+  ],
+  "COMPILE_TOOL_PROCS": [
+    "gcc",
+    "cc",
+    "cc1",
+    "as",
+    "ld",
+    "ld.bfd",
+    "collect2",
+    "lto1",
+    "lto-wrapper",
+    "make",
+    "ar",
+    "nm",
+    "install",
+    "pkgconf",
+    "git",
+    "configure"
+  ],
+  "DEPLOY_HELPER_PROCS": [
+    "mv",
+    "cp",
+    "chmod",
+    "chown",
+    "ln",
+    "mkdir",
+    "selinuxenabled",
+    "setfiles",
+    "jq",
+    "sefcontext_compile",
+    "restorecon",
+    "dnf",
+    "yum"
+  ],
+  "JUMPSERVER_PATH_MARKERS": [
+    "/opt/jumpserver",
+    "/opt/py3/bin",
+    "jumpserver.asgi",
+    "jms start",
+    "celery -A ops",
+    "gunicorn jumpserver",
+    "jumpserver/installer/releases",
+    "jumpserver-installer-"
+  ],
+  "CRON_PATH_MARKERS": [
+    "/etc/cron",
+    "/var/spool/anacron",
+    "0anacron",
+    "run-parts",
+    "/etc/debuginfod",
+    "debuginfod"
+  ],
+  "HEALTH_MARKERS": [
+    "localhost:",
+    "127.0.0.1",
+    "/healthy",
+    "gitlab-healthcheck",
+    "healthcheck"
+  ],
+  "DEPLOYMENT_MARKERS": [
+    "dnf install",
+    "yum install",
+    "apt install",
+    "apt-get install",
+    "docker compose up",
+    "docker-compose up",
+    "docker compose up -d",
+    "wget https://github.com/docker/compose",
+    "docker-ce",
+    "make usesystemd",
+    "make -j",
+    "malloc=jemalloc",
+    "redis_tar",
+    "/usr/local/bin/ansible",
+    "/data/ansible/"
+  ],
+  "OPS_USER_MARKERS": [
+    "opsvictor",
+    "opsvictor@"
+  ],
+  "OPS_EGRESS_DOMAINS": [
+    "cip.cc",
+    "ipinfo.io",
+    "ifconfig.me"
+  ],
+  "OPS_SSH_MARKERS": [
+    "opsvictor@",
+    "test_ssh_login",
+    "batchmode=yes",
+    "cloud_prod_opsvictor",
+    "sshkey/cloud_prod"
+  ],
+  "NOTIFY_SCRIPT_MARKERS": [
+    "telegram",
+    "login_notify",
+    "ssh_login_notify",
+    "notify.sh"
+  ]
+}

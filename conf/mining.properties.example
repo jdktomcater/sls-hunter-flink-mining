@@ -1,0 +1,39 @@
+# Flink 1.18.x / Java 8. Adapt to the actual Dinky runtime before deployment.
+job.name=sls-hunter-flink-mining
+parallelism=4
+kafka.bootstrap.servers=localhost:9092
+kafka.input.topics=sls-mining-normalized
+kafka.group.id=sls-mining-dev-v1
+kafka.output.topic=sls-mining-signals
+kafka.dlq.topic=sls-mining-dlq-v0
+kafka.late.topic=sls-mining-late-v0
+# Must be unique per concurrently deployed job/environment, stable on recovery.
+kafka.transaction.prefix=sls-mining-dev-v1
+# Unclean restart blocks in initTransactions until this expires. Must exceed checkpoint.interval.ms + checkpoint.timeout.ms.
+kafka.transaction.timeout.ms=180000
+kafka.linger.ms=5
+# Additional client properties: kafka.property.security.protocol, etc.
+checkpoint.storage=hdfs://nameservice1/user/sls/sls-hunter/flink-mining/checkpoints
+checkpoint.interval.ms=5000
+checkpoint.timeout.ms=120000
+baseline.days=5
+# false：不等基线封账和 fleet 快照，只跑行为模式和命令结构规则。true 时恢复历史对比。
+history.compare=false
+min.count=2
+max.signals=200
+host.spike.ratio=2.5
+emit.interval.ms=1000
+allowed.lateness.ms=600000
+retention.days=14
+# Omit to publish from the start day minus 3 calendar days in +08:00. Fixed at process start.
+# target.start.date=2026-06-10
+max.future.skew.ms=300000
+max.events.per.family.day=2000000
+# Default preserves ES fleet query results via immutable exported snapshots.
+# conf/fleet-snapshots.json is packaged at the jar root. A plain path still reads the local filesystem.
+fleet.mode=legacy_snapshot
+fleet.snapshot.file=classpath:fleet-snapshots.json
+rule.version=java-v1-legacy-fleet
+# Optional exact mode changes ES cardinality/truncation behavior and needs separate validation.
+# fleet.mode=exact
+# rule.version=java-v2-exact-fleet
