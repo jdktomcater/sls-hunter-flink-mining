@@ -7,7 +7,6 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
-import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 
@@ -36,7 +35,9 @@ final class WindowMining {
       Set<String> highRisk = J8.set("pipe_to_interpreter", "encoded_powershell", "lolbin_suspicious_target");
       if (reasons instanceof List && ((List<?>) reasons).stream().anyMatch(highRisk::contains)) {
         String key = Json.write(J8.list(event.s("host_ip"), event.s("username"), event.s("proc_name")));
-        bucket.windowStructural.computeIfAbsent(key, ignored -> new DayBucket.Aggregate()).add(event, 5);
+        DayBucket.Aggregate aggregate = bucket.windowStructural.computeIfAbsent(key, ignored -> new DayBucket.Aggregate());
+        aggregate.add(event, 5);
+        for (Object reason : (List<?>) reasons) aggregate.structuralReasons.add(String.valueOf(reason));
       }
     }
     if (!event.family.equals("tracing_sas_linux")) return;
@@ -45,10 +46,7 @@ final class WindowMining {
       if (!(severity.equals("critical") || severity.equals("high"))
           || !String.valueOf(pattern.getOrDefault("post_filter", "")).isEmpty()
           || !Behavior.matches(pattern.get("query"), event)) continue;
-      List<String> excludedProcs = (List<String>) pattern.getOrDefault("exclude_procs", Collections.emptyList());
-      List<String> excludedChains = (List<String>) pattern.getOrDefault("exclude_chains", Collections.emptyList());
-      if (excludedProcs.contains(event.s("proc_name").toLowerCase(Locale.ROOT))
-          || RuleData.containsAny(event.s("cmd_chain").toLowerCase(Locale.ROOT), excludedChains)) continue;
+      if (!Behavior.included(pattern, event)) continue;
       String key = Json.write(J8.list(pattern.get("label"), event.s("host_ip")));
       bucket.windowHighRisk.computeIfAbsent(key, ignored -> new DayBucket.Aggregate()).add(event, 5);
     }
@@ -56,20 +54,15 @@ final class WindowMining {
 
   static MiningEngine.Result evaluateChannels(String family, DayBucket target, List<DayBucket> baseline,
       boolean ready, MiningConfig config) {
+    target.requireCompatibleBehaviorState();
+    for (DayBucket bucket : baseline) bucket.requireCompatibleBehaviorState();
     List<Map<String, Object>> signals = new ArrayList<>();
     for (DayBucket.Aggregate a : target.windowStructural.values()) {
       if (a.samples.isEmpty()) continue;
       Event first = a.samples.get(0);
-      Set<String> reasons = new java.util.TreeSet<>();
-      for (Event sample : a.samples) {
-        List<Event> one = Collections.singletonList(sample);
-        Object value = Scoring.adjust(family, 0, sample.s("proc_name"), one, Templates.commands(one),
-            Templates.chains(one), Collections.<String>emptySet(), 0, false).breakdown().get("structural_reasons");
-        if (value instanceof List) for (Object reason : (List<?>) value) reasons.add(String.valueOf(reason));
-      }
       signals.add(Json.obj("signal_type", "high_risk_structure", "channel", "high_risk", "host_ip", first.s("host_ip"),
           "username", first.s("username"), "proc_name", first.s("proc_name"), "score", 70,
-          "hit_count", a.count, "structural_reasons", new ArrayList<>(reasons), "samples", a.samples));
+          "hit_count", a.count, "structural_reasons", new ArrayList<>(a.structuralReasons), "samples", a.samples));
     }
     for (Map<String, Object> pattern : Behavior.patterns()) {
       String label = String.valueOf(pattern.get("label"));
@@ -110,10 +103,10 @@ final class WindowMining {
           Set<String> known = new HashSet<>();
           for (DayBucket day : baseline) {
             DayBucket.Aggregate b = day.triples.get(entry.getKey());
-            if (b != null) { total += b.count; known.addAll(Templates.commands(b.samples).keySet()); }
+            if (b != null) { total += b.count; known.addAll(b.commandTemplates.keySet()); }
           }
           Event first = a.samples.get(0);
-          Set<String> novelTemplates = new HashSet<>(Templates.commands(a.samples).keySet());
+          Set<String> novelTemplates = new HashSet<>(a.commandTemplates.keySet());
           novelTemplates.removeAll(known);
           addHistory(signals, "triple", first.s("host_ip"), first.s("username"), first.s("proc_name"), a.count,
               total, baseline.size(), threshold, floor, config.minCount);

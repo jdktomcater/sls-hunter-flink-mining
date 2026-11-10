@@ -3,11 +3,26 @@ package com.sls.hunter.flink;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
-import java.util.Locale;
 import java.util.regex.Pattern;
 
 /** Linux 行为规则。查询是规则 JSON 里的 Elasticsearch 子集：bool、term、terms、wildcard。 */
 public final class Behavior {
+  private static final String COMMAND_BOUNDARY = "(?:^|[\\s;|&])(?:/[^\\s;|&]*/)?";
+  private static final String CRON_PATH = "(?:/etc/crontab|/etc/cron(?:\\.[^/\\s;|&>]+|/[^\\s;|&>]*)|/var/spool/cron(?:/[^\\s;|&>]*)?)";
+  private static final Pattern CRONTAB_EDIT = Pattern.compile(COMMAND_BOUNDARY
+      + "crontab\\s+(?:(?:-u\\s+\\S+|-[A-Za-z]*[A-DF-Za-df-z])\\s+)*-[A-Za-z]*e[A-Za-z]*(?:\\s|$)");
+  private static final Pattern CRONTAB_INSTALL = Pattern.compile(COMMAND_BOUNDARY
+      + "crontab\\s+(?:-u\\s+\\S+\\s+)?(?:/|\\./|\\.\\./|[A-Za-z0-9_])[^\\s;|&]*");
+  private static final Pattern CRON_WRITE = Pattern.compile("(?s)(?:>{1,2}\\s*" + CRON_PATH
+      + "|" + COMMAND_BOUNDARY + "(?:cp|mv|install|tee)\\s+[^;|&]*" + CRON_PATH + ")");
+  private static final Pattern CREDENTIAL_PATH = Pattern.compile(
+      "(?:/\\.ssh/(?:id_rsa|id_ed25519)|/etc/shadow)(?![A-Za-z0-9_./-])");
+  private static final Pattern CREDENTIAL_READER = Pattern.compile(COMMAND_BOUNDARY
+      + "(?:cat|head|tail|less|more|grep|sed|awk|cp|tar|base64|dd)\\s+");
+  private static final Pattern NETCAT_LISTEN = Pattern.compile(COMMAND_BOUNDARY
+      + "(?:nc|ncat)\\s+(?:[^;|&]*?\\s)?-[A-Za-z]*l[A-Za-z]*(?:\\s|$)");
+  private static final Pattern OTHER_LISTEN = Pattern.compile(COMMAND_BOUNDARY
+      + "(?:socat\\s+[^;|&]*TCP-LISTEN|python(?:[0-9.]*)\\s+[^;|&]*(?:http\\.server|SimpleHTTPServer|-m\\s+http))");
   private Behavior() {}
 
   @SuppressWarnings("unchecked")
@@ -15,12 +30,20 @@ public final class Behavior {
     return (List<Map<String, Object>>) RuleData.data("tracing_sas_linux").get("BEHAVIOR_PATTERNS");
   }
 
-  @SuppressWarnings("unchecked")
   static boolean included(Map<String, Object> pattern, Event event) {
-    List<String> procs = (List<String>) pattern.getOrDefault("exclude_procs", Collections.emptyList());
-    List<String> chains = (List<String>) pattern.getOrDefault("exclude_chains", Collections.emptyList());
-    return !procs.contains(event.s("proc_name").toLowerCase(Locale.ROOT))
-        && !RuleData.containsAny(event.s("cmd_chain").toLowerCase(Locale.ROOT), chains);
+    String command = event.s("cmdline");
+    String label = String.valueOf(pattern.get("label"));
+    if (label.equals("cron_persistence")) {
+      return CRONTAB_EDIT.matcher(command).find() || CRONTAB_INSTALL.matcher(command).find()
+          || CRON_WRITE.matcher(command).find();
+    }
+    if (label.equals("credential_harvest")) {
+      return CREDENTIAL_PATH.matcher(command).find() && CREDENTIAL_READER.matcher(command).find();
+    }
+    if (label.equals("port_listen_bind")) {
+      return NETCAT_LISTEN.matcher(command).find() || OTHER_LISTEN.matcher(command).find();
+    }
+    return true;
   }
 
   /** 一条规则是否命中事件。不支持的查询类型直接失败，避免静默当成未命中。 */

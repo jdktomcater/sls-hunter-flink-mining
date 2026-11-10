@@ -40,7 +40,7 @@ max.events.per.family.day=2000000
 # conf/fleet-snapshots.json is packaged at the jar root. A plain path still reads the local filesystem.
 fleet.mode=legacy_snapshot
 fleet.snapshot.file=classpath:fleet-snapshots.json
-rule.version=java-v3-behavior-host-counts
+rule.version=java-v6-full-command-analysis
 # Optional exact mode changes ES cardinality/truncation behavior and needs separate validation.
 # fleet.mode=exact
-# rule.version=java-v2-exact-fleet
+# rule.version=java-v6-full-command-analysis-exact-fleet

@@ -116,7 +116,7 @@ public class WindowMiningFunction extends KeyedProcessFunction<String, Event, St
       return;
     }
     if (config.historyCompare) WindowMining.recordHighRisk(bucket, event);
-    if (config.historyCompare && bucket.identities.size() > config.integer("max.events.per.family.day", 2000000)) {
+    if (bucket.identities.size() > config.integer("max.events.per.family.day", 2000000)) {
       LOG.error("Fixed-window identity capacity exceeded: family={}, windowStart={}, identities={}, limit={}",
           ctx.getCurrentKey(), start, bucket.identities.size(), config.integer("max.events.per.family.day", 2000000));
       throw new IllegalStateException("Fixed-window identity capacity exceeded");
@@ -344,7 +344,7 @@ public class WindowMiningFunction extends KeyedProcessFunction<String, Event, St
                 "baseline_complete",
                 ready,
                 "rule_version",
-                config.get("rule.version", "java-v1-exact-fleet"),
+                config.get("rule.version", "window-history-v4-full-command-analysis"),
                 "revision",
                 meta.revision,
                 "status",

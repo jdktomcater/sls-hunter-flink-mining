@@ -38,19 +38,14 @@
   "BEHAVIOR_PATTERNS": [
     {
       "label": "cron_persistence",
-      "description": "Crontab 写入或 /etc/cron.d 文件投放",
+      "description": "编辑或安装 crontab，或向计划任务目录写入",
       "severity": "high",
       "query": {
         "bool": {
           "should": [
             {
               "wildcard": {
-                "cmdline": "*crontab -e*"
-              }
-            },
-            {
-              "wildcard": {
-                "cmdline": "*crontab -*l*"
+                "cmdline": "*crontab*"
               }
             },
             {
@@ -62,28 +57,11 @@
               "wildcard": {
                 "cmdline": "*/var/spool/cron*"
               }
-            },
-            {
-              "wildcard": {
-                "cmdline": "*echo*>>*/etc/cron*"
-              }
-            },
-            {
-              "wildcard": {
-                "cmdline": "*echo*>>/var/spool/cron*"
-              }
             }
           ],
           "minimum_should_match": 1
         }
-      },
-      "exclude_chains": [
-        "anacron",
-        "run-parts",
-        "logrotate",
-        "yum",
-        "apt"
-      ]
+      }
     },
     {
       "label": "dns_tunnel_tool",
@@ -166,7 +144,7 @@
     },
     {
       "label": "credential_harvest",
-      "description": "读取 SSH 密钥 / shadow / 敏感凭证文件",
+      "description": "命令读取或复制 SSH 私钥或 shadow 文件",
       "severity": "high",
       "query": {
         "bool": {
@@ -183,44 +161,13 @@
             },
             {
               "wildcard": {
-                "cmdline": "*/.ssh/authorized_keys*"
-              }
-            },
-            {
-              "wildcard": {
                 "cmdline": "*/etc/shadow*"
-              }
-            },
-            {
-              "wildcard": {
-                "cmdline": "*/.ssh/known_hosts*"
-              }
-            },
-            {
-              "wildcard": {
-                "cmdline": "*find*/.ssh*"
-              }
-            },
-            {
-              "wildcard": {
-                "cmdline": "*find*id_rsa*"
-              }
-            },
-            {
-              "wildcard": {
-                "cmdline": "*cat*/etc/shadow*"
               }
             }
           ],
           "minimum_should_match": 1
         }
-      },
-      "exclude_procs": [
-        "sshd",
-        "puppet",
-        "ansible",
-        "salt-minion"
-      ]
+      }
     },
     {
       "label": "ssh_lateral_novel_target",
@@ -341,16 +288,11 @@
           ],
           "minimum_should_match": 1
         }
-      },
-      "exclude_chains": [
-        "docker",
-        "kubelet",
-        "containerd"
-      ]
+      }
     },
     {
       "label": "security_disable",
-      "description": "关闭安全防护 (SELinux/firewall/iptables 放行)",
+      "description": "关闭 SELinux、firewalld 或 ufw",
       "severity": "high",
       "query": {
         "bool": {
@@ -358,21 +300,6 @@
             {
               "wildcard": {
                 "cmdline": "*setenforce 0*"
-              }
-            },
-            {
-              "wildcard": {
-                "cmdline": "*firewall-cmd*--add-port*"
-              }
-            },
-            {
-              "wildcard": {
-                "cmdline": "*iptables*-A*ACCEPT*"
-              }
-            },
-            {
-              "wildcard": {
-                "cmdline": "*iptables*-I*ACCEPT*"
               }
             },
             {
@@ -469,7 +396,7 @@
     },
     {
       "label": "data_exfil",
-      "description": "数据外传模式 (tar+curl, base64 pipe, /dev/tcp 传文件)",
+      "description": "可能的数据传输（归档或编码后上传、curl 上传、管道发送）",
       "severity": "high",
       "query": {
         "bool": {
@@ -503,21 +430,11 @@
               "wildcard": {
                 "cmdline": "*curl*--upload*"
               }
-            },
-            {
-              "wildcard": {
-                "cmdline": "*scp*@*:*"
-              }
             }
           ],
           "minimum_should_match": 1
         }
-      },
-      "exclude_procs": [
-        "rsync",
-        "ansible",
-        "puppet"
-      ]
+      }
     }
   ]
 }

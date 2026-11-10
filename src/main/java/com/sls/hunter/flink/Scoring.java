@@ -530,15 +530,12 @@ public final class Scoring {
     return "";
   }
 
-  /** Connect 且目的地址不是 10.*、172.*、192.168.*。172 前缀比 RFC1918 更宽，保持旧规则。 */
+  /** Only a valid public-unicast candidate counts; private and unknown destinations do not. */
   private static boolean externalConnect(List<Event> samples) {
     for (Event event : samples) {
       String destination = event.s("dst_ip");
       if (event.s("type").equals("Connect")
-          && !destination.isEmpty()
-          && !destination.startsWith("10.")
-          && !destination.startsWith("172.")
-          && !destination.startsWith("192.168.")) {
+          && IpAddresses.scope(destination) == IpAddresses.Scope.PUBLIC) {
         return true;
       }
     }

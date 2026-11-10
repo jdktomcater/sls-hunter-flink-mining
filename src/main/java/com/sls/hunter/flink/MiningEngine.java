@@ -338,16 +338,16 @@ public final class MiningEngine {
             false));
   }
 
-  /** 当天样本直接交给结构规则。没有任何结构原因时不输出，避免把普通进程当成新增。 */
+  /** 全量紧凑事件用于结构规则；展示样本仍有界。 */
   private static Map<String, Object> ruleSignal(String family, DayBucket.Aggregate aggregate) {
-    List<Event> samples = aggregate.samples.stream().limit(8).collect(Collectors.toList());
+    List<Event> samples = aggregate.orderedScoringEvents();
     if (samples.isEmpty()) {
       return null;
     }
     Event sample = samples.get(0);
     String proc = sample.s("proc_name");
-    Map<String, Integer> templates = Templates.commands(samples);
-    Map<String, Integer> chains = Templates.chains(samples);
+    Map<String, Integer> templates = aggregate.commandTemplates;
+    Map<String, Integer> chains = aggregate.chainSignatures;
     Scoring.Adjustment adjustment =
         Scoring.adjust(
             family,
@@ -372,7 +372,7 @@ public final class MiningEngine {
         signal("rule_match", sample.s("host_ip"), sample.s("username"), proc, finalScore);
     row.put("score_breakdown", adjustment.breakdown());
     row.put("target_count", aggregate.count);
-    List<Event> ordered = new ArrayList<>(samples);
+    List<Event> ordered = new ArrayList<>(aggregate.samples);
     ordered.sort(
         new Comparator<Event>() {
           @Override
@@ -399,17 +399,13 @@ public final class MiningEngine {
         Event sample = entry.getValue().samples.get(0);
         procHosts.computeIfAbsent(sample.s("proc_name"), key -> new HashSet<>()).add(sample.s("host_ip"));
       }
-      for (List<Event> events : day.fetchLatest.values()) {
-        for (Event event : events) {
-          rememberParentPaths(family, event, parentPaths);
-        }
-      }
+      parentPaths.addAll(day.fetchParentPaths);
     }
     return new Baseline(hosts, tripleCounts, procHosts, parentPaths);
   }
 
   /** 基线侧保留父命令里的全部路径；评分侧只拿第一段的第一个路径做新颖比较。 */
-  private static void rememberParentPaths(String family, Event event, Set<String> parentPaths) {
+  static void rememberParentPaths(String family, Event event, Set<String> parentPaths) {
     List<String> parents = Templates.parents(event.s("cmd_chain"));
     if (parents.isEmpty()) {
       return;
@@ -497,8 +493,8 @@ public final class MiningEngine {
       DayBucket targetDay,
       List<DayBucket> baselineDays,
       Set<String> parentPaths) {
-    // 日桶保留最早 12 条，deep 再用其中最早 8 条。模板差集受这个样本上限约束。
-    List<Event> samples = targetDay.triples.get(candidate.key).samples.stream().limit(8).collect(Collectors.toList());
+    DayBucket.Aggregate target = targetDay.triples.get(candidate.key);
+    List<Event> samples = target.orderedScoringEvents();
     Set<String> baselineTemplates = new HashSet<>();
     Set<String> baselineChains = new HashSet<>();
     for (DayBucket day : baselineDays) {
@@ -506,11 +502,11 @@ public final class MiningEngine {
       if (aggregate == null) {
         continue;
       }
-      baselineTemplates.addAll(Templates.commands(aggregate.samples).keySet());
-      baselineChains.addAll(Templates.chains(aggregate.samples).keySet());
+      baselineTemplates.addAll(aggregate.commandTemplates.keySet());
+      baselineChains.addAll(aggregate.chainSignatures.keySet());
     }
-    Map<String, Integer> templates = Templates.commands(samples);
-    Map<String, Integer> chains = Templates.chains(samples);
+    Map<String, Integer> templates = new TreeMap<>(target.commandTemplates);
+    Map<String, Integer> chains = new TreeMap<>(target.chainSignatures);
     templates.keySet().removeAll(baselineTemplates);
     chains.keySet().removeAll(baselineChains);
     double baseScore =
@@ -544,7 +540,7 @@ public final class MiningEngine {
     row.put("fleet_proc_hosts_in_baseline", candidate.fleet);
     row.put("novel_templates", features(templates, "template", 8));
     row.put("novel_chain_signatures", features(chains, "chain_sig", 5));
-    List<Event> ordered = new ArrayList<>(samples);
+    List<Event> ordered = new ArrayList<>(target.samples);
     // 空命令靠后，两条样本优先留有命令行的。排序稳定，同组仍按事件时间。
     ordered.sort(
         new Comparator<Event>() {
@@ -638,20 +634,20 @@ public final class MiningEngine {
         .collect(Collectors.toList());
   }
 
-  /**
-   * Linux 行为规则。门槛用全量计数；突增分子是过滤后的样本条数，且样本最多 30 条。打开历史对比时，基线只取最近 3 个基线日的单日最大值，不是多日合计。关掉后只保留模式本身，横向新目的地址这条依赖历史，直接跳过。
-   */
+  /** Behavior thresholds and baseline comparisons use full per-host counts. */
   private static List<Map<String, Object>> behavior(
       DayBucket targetDay, List<DayBucket> baselineDays, boolean historyCompare) {
     targetDay.requireCompatibleBehaviorState();
     for (DayBucket baseline : baselineDays) baseline.requireCompatibleBehaviorState();
     List<Map<String, Object>> signals = new ArrayList<>();
-    Set<String> knownDestinations = historyCompare ? baselineDestinations(baselineDays) : Collections.<String>emptySet();
     for (Map<String, Object> pattern : Behavior.patterns()) {
       String label = pattern.get("label").toString();
       String postFilter = pattern.getOrDefault("post_filter", "").toString();
       boolean lateral = postFilter.equals("_lateral_novel_dst");
-      if (lateral && !historyCompare) continue;
+      if (lateral) {
+        if (historyCompare) signals.addAll(lateralSignals(pattern, targetDay, baselineDays));
+        continue;
+      }
       if (!postFilter.isEmpty() && !lateral && !postFilter.equals("_dns_tunnel_heuristic")) {
         throw new IllegalArgumentException("Unsupported behavior post-filter: " + postFilter);
       }
@@ -659,7 +655,7 @@ public final class MiningEngine {
       Map<String, Map<String, DayBucket.Aggregate>> hosts =
           targetDay.behaviorHosts.getOrDefault(label, Collections.emptyMap());
       for (Map.Entry<String, Map<String, DayBucket.Aggregate>> host : hosts.entrySet()) {
-        DayBucket.Aggregate hits = behaviorCount(host.getValue(), lateral ? knownDestinations : Collections.<String>emptySet());
+        DayBucket.Aggregate hits = behaviorCount(host.getValue(), Collections.<String>emptySet());
         if (hits.count < minimum || hits.samples.isEmpty()) continue;
         long baselineMax = 0;
         if (historyCompare) {
@@ -667,7 +663,7 @@ public final class MiningEngine {
             Map<String, DayBucket.Aggregate> groups = day.behaviorHosts
                 .getOrDefault(label, Collections.emptyMap()).getOrDefault(host.getKey(), Collections.emptyMap());
             baselineMax = Math.max(baselineMax,
-                behaviorCount(groups, lateral ? knownDestinations : Collections.<String>emptySet()).count);
+                behaviorCount(groups, Collections.<String>emptySet()).count);
           }
         }
         double ratio = historyCompare ? hits.count / (baselineMax + 1.0) : hits.count;
@@ -690,36 +686,42 @@ public final class MiningEngine {
     return result;
   }
 
-  /** 最近 3 个基线日里，横向移动样本出现过的目的地址。 */
-  private static Set<String> baselineDestinations(List<DayBucket> baselineDays) {
-    Set<String> destinations = new HashSet<>();
-    baselineDays.stream()
-        .limit(3)
-        .forEach(
-            day ->
-                day.lateralLatest.forEach(
-                    event -> {
-                      if (!event.s("dst_ip").isEmpty()) {
-                        destinations.add(event.s("dst_ip"));
-                      }
-                    }));
-    return destinations;
-  }
-
-  /**
-   * 丢掉没有新内网目的地址的样本。没有 IP 时只保留命令行里带 @ 的；有 IP 时必须是没见过的
-   * 10/172/192.168/100 段。
-   */
-  static boolean seenOrExternal(Event event, Set<String> knownDestinations) {
-    String ip = event.s("dst_ip");
-    if (ip.isEmpty()) {
-      return !event.s("cmdline").contains("@");
+  /** Compare destination sets within the same source host and user, using all stored events. */
+  private static List<Map<String, Object>> lateralSignals(
+      Map<String, Object> pattern, DayBucket target, List<DayBucket> baselineDays) {
+    String label = pattern.get("label").toString();
+    List<Map<String, Object>> signals = new ArrayList<>();
+    Map<String, Map<String, DayBucket.Aggregate>> hosts =
+        target.behaviorHosts.getOrDefault(label, Collections.emptyMap());
+    for (Map.Entry<String, Map<String, DayBucket.Aggregate>> host : hosts.entrySet()) {
+      Map<String, Map<String, DayBucket.Aggregate>> actors = new TreeMap<>();
+      for (Map.Entry<String, DayBucket.Aggregate> group : host.getValue().entrySet()) {
+        if (group.getValue().samples.isEmpty()) continue;
+        String user = group.getValue().samples.get(0).s("username");
+        actors.computeIfAbsent(user, ignored -> new TreeMap<>()).put(group.getKey(), group.getValue());
+      }
+      Map<String, Set<String>> knownByActor = new HashMap<>();
+      if (!host.getKey().isEmpty()) {
+        for (DayBucket day : baselineDays.subList(0, Math.min(3, baselineDays.size()))) {
+          Map<String, DayBucket.Aggregate> groups = day.behaviorHosts
+              .getOrDefault(label, Collections.emptyMap()).getOrDefault(host.getKey(), Collections.emptyMap());
+          for (Map.Entry<String, DayBucket.Aggregate> group : groups.entrySet()) {
+            if (group.getValue().samples.isEmpty()) continue;
+            String user = group.getValue().samples.get(0).s("username");
+            if (!user.isEmpty()) knownByActor.computeIfAbsent(user, ignored -> new HashSet<>()).add(group.getKey());
+          }
+        }
+      }
+      for (Map.Entry<String, Map<String, DayBucket.Aggregate>> actor : actors.entrySet()) {
+        Set<String> known = knownByActor.getOrDefault(actor.getKey(), Collections.emptySet());
+        DayBucket.Aggregate hits = behaviorCount(actor.getValue(), known);
+        int minimum = ((Number) pattern.getOrDefault("min_count_threshold", 1)).intValue();
+        if (hits.count >= minimum && !hits.samples.isEmpty()) {
+          signals.add(behaviorSignal(pattern, label, host.getKey(), hits.samples, hits.count, 0, hits.count, true));
+        }
+      }
     }
-    return knownDestinations.contains(ip)
-        || !(ip.startsWith("10.")
-            || ip.startsWith("172.")
-            || ip.startsWith("192.168.")
-            || ip.startsWith("100."));
+    return signals;
   }
 
   private static Map<String, Object> behaviorSignal(

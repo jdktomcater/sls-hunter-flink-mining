@@ -13,7 +13,7 @@ java -cp target/sls-hunter-flink-mining-1.0.0-SNAPSHOT.jar \
 
 打包配置启用了 `maven-jar-plugin.forceCreation`：每次先重建仅含项目类和资源的普通 JAR，再由 Shade 生成胖 JAR，避免不执行 `clean` 时把上次胖 JAR 再次作为输入。请使用 `mvn package` 或 `mvn verify`，不要直接反复执行 `mvn shade:shade`。
 
-`ReplayJob` 是有界本地规则回放入口，不连接 Kafka。测试包含 480 组旧 Python 评分对照，以及日桶采样、基线求和、Nginx、Flink checkpoint 恢复、迟到撤回等。`scripts/generate_oracle.py` 可从相邻旧项目重新生成评分金样本，仅调用纯规则函数，不查询外部服务，不写旧目录。
+`ReplayJob` 是有界本地规则回放入口，不连接 Kafka。测试使用 480 组旧 Python 评分样本中不受新版地址分类影响的用例，并单独测试新的地址规则；还覆盖日桶采样、基线求和、Nginx、Flink checkpoint 恢复、迟到撤回等。`scripts/generate_oracle.py` 可从相邻旧项目重新生成评分金样本，仅调用纯规则函数，不查询外部服务，不写旧目录。
 
 ## 日志输出
 
@@ -59,13 +59,21 @@ java -cp target/sls-hunter-flink-mining-1.0.0-SNAPSHOT.jar \
 
 `jdbc.enabled=true` 时，同一条结果快照再写入 PostgreSQL 表 `mining_window`（可用 `jdbc.table` 改名）。Kafka 三个事务 sink 保持不变，DLQ 和 late 不进数据库。表的主键是 `index_family, target_day`，`snapshot` 列保存与 Kafka 相同的 JSON；冲突时只接受更大的 `revision`。JDBC 是至少一次，靠这个条件收成按窗口幂等，和 Kafka 不是同一个事务。作业启动时执行 `CREATE TABLE IF NOT EXISTS`；账号不能建表时先跑 [deploy/postgres-mining-window.sql](deploy/postgres-mining-window.sql)。默认 `jdbc.enabled=false`，避免未填密码就连库。密码放在 `jdbc.password`，不要放进 URL。库不在 `public` 时用 `currentSchema` 查询参数。
 
-业务日固定 +08:00，基线是前 N 个日历日。为兼容旧查询，`23:59:59.000` 之后的当日亚秒事件被排除。采样使用事件时间最早 8/12 条；同时间戳以 event_id 打破不确定顺序。原始日志按天保留身份去重，样本按实体有界保留。
+业务日固定 +08:00，基线是前 N 个日历日。为兼容旧查询，`23:59:59.000` 之后的当日亚秒事件被排除。命令结构评分使用三元组的全部事件所需字段，命令模板和父链签名按全量事件累计；采样只用于展示，展示样本不保证包含所有命中证据。同时间戳以 event_id 打破顺序。
+
+完整分析会在状态中按三元组保存每条事件的命令、父链、路径和其他评分字段，另保存模板及父链计数；这可能显著增加状态、序列化开销、checkpoint 时间和敏感数据保留量。日作业按族和日、固定窗口按族和窗口受 `max.events.per.family.day` 身份数限制，超过时作业失败，不会静默采样；该上限不限制单条事件大小或总字节数，部署前必须按实际日志压测。开启日历史对比时，既有次数门槛、突增筛选、deep 名额和最终输出上限仍然生效，完整特征不保证每个三元组进入评分或最终输出。
 
 状态为 Flink 托管状态（JSON schema v1），包括日桶、去重身份、上次快照、修订号和定时器。固定 operator UID/maxParallelism；兼容的升级从 Savepoint 恢复，不跳过旧状态。持久化 checkpoint 路径和 transaction prefix 必须按环境配置。
 
-行为规则使用规则和主机维度的完整命中计数，排除条件在计数前生效；历史比较使用同一主机最近三个基线日的最大计数。DNS 高频规则按单主机每天至少 50 次 `nslookup`、`dig` 或 `host` 事件触发，不分析域名特征。横向移动在目标地址过滤后计数；证据样本仍有上限。输出上限仍可能截断信号。
+行为规则使用规则和主机维度的完整命中计数，历史比较使用同一主机最近三个基线日的最大计数。DNS 高频规则按单主机每天至少 50 次 `nslookup`、`dig` 或 `host` 事件触发，不分析域名特征。横向移动在目标地址过滤后计数；证据样本仍有上限。输出上限仍可能截断信号。
 
-**行为计数升级需要从输入重新回放。** 旧 savepoint 中的行为桶只有全族计数和有限样本，无法还原各主机或目的地址的完整计数；读到这类非空旧状态时作业会明确失败，不能直接从旧 savepoint 升级。请使用新的消费组、checkpoint 和隔离输出，从所需基线期开始回放并核验后再切换。新计数按主机和横向目的地址保存，状态大小需要在生产数据量下评估。
+横向移动规则以源 `host_ip`、`username` 和规范化目标 IP 为基线身份，比较最近三个基线日的全部 SSH、SCP、SFTP、rsync 事件，不同主机或用户的历史不会互相豁免；缺少源主机或用户名时不会使用基线豁免。目标必须是有效 IP：IPv4 RFC1918、共享地址 `100.64.0.0/10` 或 IPv6 ULA `fc00::/7`，缺失地址、域名和其他地址不作内网目标判断。实际企业地址范围可能不同，这不是网络拓扑或资产归属判断。
+
+Windows/跳板机的 `novel_external_connect` 原有字段名保留，但只表示存在公网单播候选连接，不表示该地址相对历史是新的。地址判断不执行 DNS 查询，保守地把回环、链路本地、文档网段、组播、无效和其他特殊用途地址视作未知；并不保证公网候选在具体网络中实际可路由。判断范围需随 [IANA IPv4](https://www.iana.org/assignments/iana-ipv4-special-registry) 和 [IPv6](https://www.iana.org/assignments/iana-ipv6-special-registry) 特殊地址登记及本地网络规划定期核验。
+
+Linux 规则只将编辑或安装 crontab、向计划任务目录写入作为持久化线索；读取私钥或 shadow 的规则要求可识别的读取、复制或打包命令。普通 scp、查询计划任务和单独的防火墙端口放行不再视为攻击信号。不再仅凭父链或进程名称自动豁免。命令匹配仍是启发式：可识别的合法操作也可能命中，脚本内部操作、命令变体及其他读取工具可能漏检；应结合资产、权限和进程上下文核验。
+
+**本次规则升级需要从输入重新回放日作业和固定窗口作业。** 旧状态缺少完整命令、模板及父链信息，也无法准确转换早期行为聚合。读取不兼容的非空旧状态时作业会明确失败，不能直接从旧 savepoint 升级。请使用新的消费组、checkpoint 和隔离输出，从所需基线期开始回放并核验后再切换。
 
 `MiningJob` checkpoint 超时的配置、优化边界与上线验证见 [checkpoint 排查说明](docs/checkpoint-tuning.md)。
 
@@ -74,7 +82,7 @@ java -cp target/sls-hunter-flink-mining-1.0.0-SNAPSHOT.jar \
 `WindowMiningJob` 与按日作业并行，使用独立消费组。窗口按事件时间对齐到 Unix 纪元，默认 5 分钟；开启历史对比时窗口长度必须整除 24 小时。当前配置 `history.compare=true`，使用两个独立通道：
 
 - `high_risk`：Linux 的 high/critical 行为模式（不包含依赖历史目的地址的规则）以及命中管道执行解释器、编码 PowerShell、可疑 LOLBin 结构的事件，逐条匹配并按窗口计数；不等待历史基线。信号仍受 `window.min.score` 过滤。规则是启发式线索，不等同于确认攻击。
-- `history`：按 `baseline.days` 取过去 N 天相同时间段，比较 SAS 三元组次数和采样命令模板，以及 Nginx URI / 新 upstream。三元组和 URI 的突增倍率为目标窗口次数除以 `max(历史窗口平均次数, window.history.baseline.floor)`，阈值为 `window.history.spike.ratio`；目标次数需达到 `min.count`。模板对比仍受每个三元组最早 12 条样本限制。该通道不计算日作业的 fleet、新主机、父链和历史行为模式，不能视作完整复刻日规则。
+- `history`：按 `baseline.days` 取过去 N 天相同时间段，比较 SAS 三元组次数和全量命令模板，以及 Nginx URI / 新 upstream。三元组和 URI 的突增倍率为目标窗口次数除以 `max(历史窗口平均次数, window.history.baseline.floor)`，阈值为 `window.history.spike.ratio`；目标次数需达到 `min.count`。该通道不计算日作业的 fleet、新主机、父链和历史行为模式，不能视作完整复刻日规则。
 
 历史窗口所属的每天都必须收到同族 `SEAL`，零事件的已封账窗口才视为 0。缺失封账时仅输出高危通道，`baseline_complete=false`；封账到达后重新计算保留的已关闭窗口。上游必须保证同族数据和封账的顺序与完整性，历史导入要覆盖基线期；越过 watermark 允许迟到范围的事件进入 late topic，需离线回放。基线同一时段的聚合保留 N+2 天并使用 Flink 状态和 checkpoint；迟到封账最多影响关闭后保留期内的窗口，超期需要离线重算。全量命中计数与有界样本分开，实际容量、延迟和 checkpoint 需在部署环境压测。
 
@@ -95,6 +103,6 @@ java -cp target/sls-hunter-flink-mining-1.0.0-SNAPSHOT.jar \
 
 首版以 **family 为一致性边界**，在一次定时计算中统一处理 fleet、新主机、deep 预筛、全局排名与撤回，避免遗漏跨键更新。每条事件先写入托管待处理状态，每批按日合并一次并遍历保留的日桶；同族没有跨 TaskManager 分片。这是可运行的正确性基线，**不能据此承诺生产大流量下 1～3 秒延迟**。提高 parallelism 只会并行不同族；高吞吐需将日桶拆为细键增量状态和版本化排名流程，再做容量测试。达到每日身份数上限会明确失败，避免静默丢事件。
 
-当前 Java 日历日主链已实现；旧任意秒级范围中混合查询边界的缺陷没有复制为新的 API。`ReplayJob` 当前同样按日评估。旧 HDFS 五文件和 `agent_bundle` 报告打包层未迁移，输出是新的实时快照协议；它不能直接替代依赖旧报告格式的消费者。ES terms 主机截断、ES wildcard 在不同 mapping 下的索引语义和同分并发排序可能与 Java 全字段匹配存在差异，需用实际冻结输入验收。480 组评分通过仅证明这些用例的规则评分一致，不代表全量端到端已证明等价。
+当前 Java 日历日主链已实现；旧任意秒级范围中混合查询边界的缺陷没有复制为新的 API。`ReplayJob` 当前同样按日评估。旧 HDFS 五文件和 `agent_bundle` 报告打包层未迁移，输出是新的实时快照协议；它不能直接替代依赖旧报告格式的消费者。ES terms 主机截断、ES wildcard 在不同 mapping 下的索引语义和同分并发排序可能与 Java 全字段匹配存在差异，需用实际冻结输入验收。旧评分样本仅覆盖有限场景，地址分类已有有意差异，不代表全量端到端等价。
 
 [详细目标架构与后续扩展设计](docs/realtime-design.md)描述的是完整演进方案；其中分布式细键状态和任意范围回放不应误认为本版已经实现。

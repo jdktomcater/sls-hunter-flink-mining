@@ -11,7 +11,7 @@ import java.util.TreeMap;
 import java.util.TreeSet;
 
 /**
- * 一天的聚合。身份集合完整保留，用来去重；命令样本、首条日志和父路径证据按实体截断。
+ * 一天的聚合。身份和结构评分字段完整保留；展示样本按实体截断。
  *
  * <p>三元组要求 username、proc_name、host_ip 三个字段都存在，空字符串也算存在，与旧 composite 聚合一致。
  */
@@ -21,13 +21,10 @@ public class DayBucket {
   private static final int HOST_FIRST_LOGS = 3;
   private static final int URI_SAMPLES = 5;
   private static final int TRIPLE_SAMPLES = 12;
-  private static final int FETCH_LATEST = 120;
   private static final int PATTERN_SAMPLES = 30;
-  private static final int LATERAL_LATEST = 500;
   private static final List<String> WINDOWS_FETCH =
       J8.list("curl", "curl.exe", "wget", "powershell", "powershell.exe");
   private static final List<String> UNIX_FETCH = J8.list("curl", "wget");
-  private static final List<String> LATERAL_PROCS = J8.list("ssh", "scp", "rsync");
 
   public Set<String> identities = new HashSet<>();
   public Map<String, Set<String>> procHosts = new TreeMap<>();
@@ -38,11 +35,15 @@ public class DayBucket {
   public Map<String, Aggregate> patterns = new TreeMap<>();
   /** Full counts by rule, host and (for lateral movement) destination. */
   public Map<String, Map<String, Map<String, Aggregate>>> behaviorHosts = new TreeMap<>();
+  /** Null on state written before the current behavior matching rules. */
+  public Integer behaviorRulesVersion;
   /** Fixed-window high-risk matches, keyed by rule and host, counted before sampling. */
   public Map<String, Aggregate> windowHighRisk = new TreeMap<>();
   public Map<String, Aggregate> windowStructural = new TreeMap<>();
   public Map<String, List<Event>> firstHost = new TreeMap<>();
   public Map<String, List<Event>> fetchLatest = new TreeMap<>();
+  /** All distinct baseline parent paths from eligible fetch events. */
+  public Set<String> fetchParentPaths = new TreeSet<>();
   public List<Event> lateralLatest = new ArrayList<>();
   public long events;
   public boolean sealed;
@@ -53,12 +54,41 @@ public class DayBucket {
   public static class Aggregate {
     public long count;
     public List<Event> samples = new ArrayList<>();
+    /** Compact full-event inputs for scoring, used only by SAS triples. */
+    public List<Event> scoringEvents = new ArrayList<>();
+    public Map<String, Integer> commandTemplates = new TreeMap<>();
+    public Map<String, Integer> chainSignatures = new TreeMap<>();
+    /** Full union of matching fixed-window structural reasons. */
+    public Set<String> structuralReasons = new TreeSet<>();
 
     public Aggregate() {}
 
     public void add(Event event, int limit) {
       count++;
       keep(samples, event, limit, false);
+    }
+
+    void addTriple(Event event) {
+      add(event, TRIPLE_SAMPLES);
+      Event compact = new Event();
+      compact.family = event.family;
+      compact.id = event.id;
+      compact.time = event.time;
+      for (String key : J8.list("host_ip", "username", "proc_name", "cmdline", "cmd_chain",
+          "proc_path", "dst_ip", "domain", "type")) {
+        if (event.fields.containsKey(key)) compact.fields.put(key, event.fields.get(key));
+      }
+      scoringEvents.add(compact);
+      if (event.s("cmdline").trim().length() >= 4)
+        commandTemplates.merge(Templates.command(event.s("cmdline")), 1, Integer::sum);
+      String chain = Templates.chain(event.s("cmd_chain"));
+      if (!chain.isEmpty()) chainSignatures.merge(chain, 1, Integer::sum);
+    }
+
+    List<Event> orderedScoringEvents() {
+      List<Event> ordered = new ArrayList<>(scoringEvents);
+      ordered.sort(Event.ORDER);
+      return ordered;
     }
   }
 
@@ -78,6 +108,7 @@ public class DayBucket {
 
   public boolean add(Event event, boolean legacyDayBoundary) {
     requireCompatibleBehaviorState();
+    behaviorRulesVersion = 4;
     LocalTime local = Instant.ofEpochMilli(event.time).atZone(Event.ZONE).toLocalTime();
     if (legacyDayBoundary && local.toSecondOfDay() == LAST_SECOND_OF_DAY && local.getNano() > 0) {
       return false;
@@ -117,15 +148,11 @@ public class DayBucket {
     if (event.fields.get("username") != null
         && event.fields.get("proc_name") != null
         && event.fields.get("host_ip") != null) {
-      triples.computeIfAbsent(event.triple(), key -> new Aggregate()).add(event, TRIPLE_SAMPLES);
+      triples.computeIfAbsent(event.triple(), key -> new Aggregate()).addTriple(event);
     }
     List<String> fetchProcs = event.family.equals("tracing_sas_win") ? WINDOWS_FETCH : UNIX_FETCH;
     if (fetchProcs.contains(event.s("proc_name"))) {
-      keep(
-          fetchLatest.computeIfAbsent(event.s("proc_name"), key -> new ArrayList<>()),
-          event,
-          FETCH_LATEST,
-          true);
+      MiningEngine.rememberParentPaths(event.family, event, fetchParentPaths);
     }
     if (!event.family.equals("tracing_sas_linux")) {
       return;
@@ -134,22 +161,20 @@ public class DayBucket {
       if (Behavior.matches(pattern.get("query"), event) && Behavior.included(pattern, event)) {
         String group = "";
         if ("_lateral_novel_dst".equals(pattern.get("post_filter"))) {
-          if (MiningEngine.seenOrExternal(event, java.util.Collections.<String>emptySet())) continue;
-          group = event.s("dst_ip");
+          String destination = IpAddresses.canonical(event.s("dst_ip"));
+          if (IpAddresses.scope(destination) != IpAddresses.Scope.INTERNAL) continue;
+          group = Json.write(J8.list(event.s("username"), destination));
         }
         behaviorHosts.computeIfAbsent(pattern.get("label").toString(), key -> new TreeMap<>())
             .computeIfAbsent(event.s("host_ip"), key -> new TreeMap<>())
             .computeIfAbsent(group, key -> new Aggregate()).add(event, PATTERN_SAMPLES);
       }
     }
-    if (LATERAL_PROCS.contains(event.s("proc_name"))) {
-      keep(lateralLatest, event, LATERAL_LATEST, true);
-    }
   }
 
   void requireCompatibleBehaviorState() {
-    if (!patterns.isEmpty()) {
-      throw new IllegalStateException("Legacy behavior state lacks per-host counts; replay input into a fresh state");
+    if (!patterns.isEmpty() || (events > 0 && !Integer.valueOf(4).equals(behaviorRulesVersion))) {
+      throw new IllegalStateException("Incompatible behavior rule state; replay input into a fresh state");
     }
   }
 }

