@@ -80,7 +80,7 @@ class PostgresSnapshotsTest {
                 "revision",
                 2,
                 "status",
-                "FINAL",
+                "LTS",
                 "rule_version",
                 "java-v1-legacy-fleet",
                 "computed_at",
@@ -95,6 +95,7 @@ class PostgresSnapshotsTest {
     assertEquals(OffsetDateTime.parse("2026-06-10T02:05:00Z"), row.windowEnd);
     assertEquals(LocalDate.parse("2026-06-10"), row.targetDay);
     assertEquals(2L, row.revision);
+    assertEquals("LTS", row.status);
     assertEquals(1, row.signalCount);
   }
 

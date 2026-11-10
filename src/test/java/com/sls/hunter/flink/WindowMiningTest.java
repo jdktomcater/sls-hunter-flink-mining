@@ -112,7 +112,7 @@ class WindowMiningTest {
       harness.processWatermark(new Watermark(start + 60_000));
       assertEquals(1, harness.extractOutputValues().size());
       Map<String, Object> first = Json.map(harness.extractOutputValues().get(0));
-      assertEquals("FINAL", first.get("status"));
+      assertEquals("LTS", first.get("status"));
       assertEquals(1L, ((Number) first.get("revision")).longValue());
       assertEquals("2026-06-10T02:00:00Z", first.get("window_start"));
       assertEquals("2026-06-10T02:01:00Z", first.get("window_end"));
@@ -169,9 +169,12 @@ class WindowMiningTest {
       assertEquals(2L, ((Number) corrected.get("revision")).longValue());
       assertEquals(2, signals(corrected).size());
       harness.processWatermark(new Watermark(start + 70_000));
+      Map<String, Object> finalSnapshot = Json.map(harness.extractOutputValues().get(2));
+      assertEquals("LTS", finalSnapshot.get("status"));
+      assertEquals(3L, ((Number) finalSnapshot.get("revision")).longValue());
       send(harness, at("shell-d", start + 2000, "10.0.0.5", "bash", SHELL));
       assertEquals(1, harness.getSideOutput(WindowMiningFunction.LATE).size());
-      assertEquals(2, harness.extractOutputValues().size());
+      assertEquals(3, harness.extractOutputValues().size());
     }
   }
 
@@ -195,7 +198,7 @@ class WindowMiningTest {
       harness.setProcessingTime(start + 1000);
       harness.processWatermark(new Watermark(start + 60_000));
       Map<String, Object> snapshot = Json.map(harness.extractOutputValues().get(0));
-      assertEquals("FINAL", snapshot.get("status"));
+      assertEquals("LTS", snapshot.get("status"));
       assertEquals("reverse_shell", signals(snapshot).get(0).get("behavior_label"));
     }
   }
@@ -230,6 +233,67 @@ class WindowMiningTest {
 
   private static Event seal(String day) {
     return Event.parse(Json.write(Json.obj("kind", "SEAL", "index_family", "tracing_sas_linux", "day", day)));
+  }
+
+  @Test
+  void ltsWaitsForBaselineAfterLatenessAndDoesNotChangeOnDuplicateSeal() throws Exception {
+    long start = Instant.parse("2026-06-10T02:00:00Z").toEpochMilli();
+    try (KeyedOneInputStreamOperatorTestHarness<String, Event, String> h = harness(historyConfig())) {
+      h.open();
+      send(h, at("shell", start, "10.0.0.1", "bash", SHELL));
+      h.processWatermark(new Watermark(start + 60_000));
+      assertEquals("FINAL", Json.map(h.extractOutputValues().get(0)).get("status"));
+      h.processWatermark(new Watermark(start + 70_000));
+      assertEquals(1, h.extractOutputValues().size());
+      send(h, seal("2026-06-09"));
+      Map<String, Object> lts = Json.map(h.extractOutputValues().get(1));
+      assertEquals("LTS", lts.get("status"));
+      assertEquals(2L, ((Number) lts.get("revision")).longValue());
+      assertEquals(true, lts.get("baseline_complete"));
+      send(h, seal("2026-06-09"));
+      send(h, at("too-late", start + 1, "10.0.0.2", "bash", SHELL));
+      assertEquals(2, h.extractOutputValues().size());
+      assertEquals(1, h.getSideOutput(WindowMiningFunction.LATE).size());
+    }
+  }
+
+  @Test
+  void ltsTimerSurvivesCheckpoint() throws Exception {
+    long start = Instant.parse("2026-06-10T02:00:00Z").toEpochMilli();
+    MiningConfig settings = config(60_000, 10_000, 0);
+    OperatorSubtaskState checkpoint;
+    try (KeyedOneInputStreamOperatorTestHarness<String, Event, String> h = harness(settings)) {
+      h.open();
+      send(h, at("shell", start, "10.0.0.1", "bash", SHELL));
+      h.processWatermark(new Watermark(start + 60_000));
+      checkpoint = h.snapshot(1, start + 60_000);
+    }
+    try (KeyedOneInputStreamOperatorTestHarness<String, Event, String> h = harness(settings)) {
+      h.initializeState(checkpoint);
+      h.open();
+      h.processWatermark(new Watermark(start + 70_000));
+      Map<String, Object> lts = Json.map(h.extractOutputValues().get(0));
+      assertEquals("LTS", lts.get("status"));
+      assertEquals(2L, ((Number) lts.get("revision")).longValue());
+    }
+  }
+
+  @Test
+  void ltsFollowsLatenessWhenBaselineAlreadySealed() throws Exception {
+    long start = Instant.parse("2026-06-10T02:00:00Z").toEpochMilli();
+    try (KeyedOneInputStreamOperatorTestHarness<String, Event, String> h = harness(historyConfig())) {
+      h.open();
+      send(h, seal("2026-06-09"));
+      send(h, at("shell", start, "10.0.0.1", "bash", SHELL));
+      h.processWatermark(new Watermark(start + 60_000));
+      assertEquals("FINAL", Json.map(h.extractOutputValues().get(0)).get("status"));
+      h.processWatermark(new Watermark(start + 69_999));
+      assertEquals(1, h.extractOutputValues().size());
+      h.processWatermark(new Watermark(start + 70_000));
+      Map<String, Object> lts = Json.map(h.extractOutputValues().get(1));
+      assertEquals("LTS", lts.get("status"));
+      assertEquals(2L, ((Number) lts.get("revision")).longValue());
+    }
   }
 
   @Test

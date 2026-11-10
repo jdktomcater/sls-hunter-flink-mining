@@ -74,7 +74,7 @@ java -cp target/sls-hunter-flink-mining-1.0.0-SNAPSHOT.jar \
 
 历史窗口所属的每天都必须收到同族 `SEAL`，零事件的已封账窗口才视为 0。缺失封账时仅输出高危通道，`baseline_complete=false`；封账到达后重新计算保留的已关闭窗口。上游必须保证同族数据和封账的顺序与完整性，历史导入要覆盖基线期；越过 watermark 允许迟到范围的事件进入 late topic，需离线回放。基线同一时段的聚合保留 N+2 天并使用 Flink 状态和 checkpoint；迟到封账最多影响关闭后保留期内的窗口，超期需要离线重算。全量命中计数与有界样本分开，实际容量、延迟和 checkpoint 需在部署环境压测。
 
-快照包含 `baseline_mode`、`baseline_complete` 和 `baseline_dates`，信号包含 `channel`。窗口第一次输出为 `FINAL`，后续变化为 `CORRECTED`；`FINAL` 是窗口首次关闭语义，不表示历史基线已就绪或迟到期结束。已输出窗口变为空时发送空 `REPLACE` 和撤回 ID。Kafka 使用事务 sink；PostgreSQL 按窗口 revision upsert，但与 Kafka 不在同一事务。`history.compare=false` 保持原来的规则模式。切换历史模式应从头回放完整基线，旧模式的 savepoint 不含历史封账和高危计数，不可当作已预热基线。
+快照包含 `baseline_mode`、`baseline_complete` 和 `baseline_dates`，信号包含 `channel`。窗口第一次输出为 `FINAL`，后续变化为 `CORRECTED`；`FINAL` 是窗口首次关闭语义，不表示历史基线已就绪或迟到期结束。当 watermark 到达窗口结束加允许迟到时间，且历史模式所需的基线均已封账后，作业发送递增 revision 的 `LTS` 快照：当前在线计算不再修正该窗口。未开启历史模式时无需等待基线；如果两项条件在首次输出时已满足，则首次快照直接为 `LTS`。基线一直未就绪或 watermark 未推进时不会进入 `LTS`。已输出窗口变为空时发送空 `REPLACE` 和撤回 ID；没有输出过信号的窗口不创建记录。Kafka 使用事务 sink；PostgreSQL 按窗口 revision upsert，但与 Kafka 不在同一事务。`LTS` 只代表该次在线计算的终态。JDBC 至少一次写入不与 checkpoint 原子提交，故障回滚后重放可能再次更新数据库；人工 SQL、其他作业或离线重算也不受此标记限制。超期数据仍需按约定离线处理。从旧版本 savepoint 恢复时，升级前已关闭的窗口没有新增的终态定时器，可能不会自动变成 `LTS`；如需覆盖历史行，应使用隔离输出回放并核验，不能仅依据墙钟批量改状态。`history.compare=false` 保持原来的规则模式。切换历史模式应从头回放完整基线，旧模式的 savepoint 不含历史封账和高危计数，不可当作已预热基线。
 
 入口是 [deploy/dinky-submit-window.sql](deploy/dinky-submit-window.sql)，配置是打包进 JAR 的 `window-mining.properties`。账号不能建表时先跑 [deploy/postgres-mining-window-fixed.sql](deploy/postgres-mining-window-fixed.sql)。`kafka.group.id` 和 `kafka.transaction.prefix` 不能与按日作业相同。
 

@@ -1,6 +1,7 @@
 -- One fixed event-time window per index_family + window_start.
 -- The window job runs this statement on startup. Apply it here when the job user cannot create tables.
 -- A replayed or older revision does not overwrite a newer row.
+-- status is text: FINAL / CORRECTED are mutable, LTS is the online job's terminal snapshot.
 CREATE TABLE IF NOT EXISTS mining_window_fixed (
   index_family text NOT NULL,
   window_start timestamptz NOT NULL,

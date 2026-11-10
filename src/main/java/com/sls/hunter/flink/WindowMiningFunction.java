@@ -147,6 +147,16 @@ public class WindowMiningFunction extends KeyedProcessFunction<String, Event, St
   public void onTimer(long timestamp, OnTimerContext ctx, Collector<String> out) throws Exception {
     long closingStart = timestamp - config.windowSizeMillis;
     if (buckets.contains(closingStart)) close(ctx, out, closingStart, timestamp);
+    long finalStart = timestamp - config.windowSizeMillis - config.latenessMillis;
+    String finalBucket = buckets.get(finalStart);
+    if (finalBucket != null) {
+      Meta meta = meta(finalStart);
+      if (meta.closed && !meta.longTerm) {
+        publish(ctx.getCurrentKey(), out, finalStart, Json.MAPPER.readValue(finalBucket, DayBucket.class),
+            meta, ctx.timerService().currentProcessingTime(), ctx.timerService().currentWatermark());
+        metas.put(finalStart, Json.write(meta.toMap()));
+      }
+    }
     long retention = config.historyCompare ? (config.baselineDays + 2L) * DAY_MS : 0;
     long expiringStart = timestamp - config.windowSizeMillis - retention - config.latenessMillis;
     buckets.remove(expiringStart);
@@ -176,6 +186,9 @@ public class WindowMiningFunction extends KeyedProcessFunction<String, Event, St
   /** 窗口关闭后还在迟到范围内就留着状态，并登记清理定时器。已经超过迟到则马上丢掉。 */
   private void remember(Context ctx, long start, long end, Meta meta, long watermark)
       throws Exception {
+    if (!meta.longTerm && watermark < end + config.latenessMillis) {
+      ctx.timerService().registerEventTimeTimer(end + config.latenessMillis);
+    }
     if (config.historyCompare) {
       long expiry = end + (config.baselineDays + 2L) * DAY_MS + config.latenessMillis;
       if (watermark >= expiry) { buckets.remove(start); metas.remove(start); return; }
@@ -225,6 +238,7 @@ public class WindowMiningFunction extends KeyedProcessFunction<String, Event, St
   private void publish(
       String family, Collector<String> out, long start, DayBucket bucket, Meta meta, long computedAt, long watermark)
       throws Exception {
+    if (meta.longTerm) return;
     LocalDate day = Instant.ofEpochMilli(start).atZone(Event.ZONE).toLocalDate();
     List<DayBucket> baseline = new ArrayList<>();
     List<String> baselineDates = new ArrayList<>();
@@ -264,7 +278,9 @@ public class WindowMiningFunction extends KeyedProcessFunction<String, Event, St
                 result.shallow(),
                 "stats",
                 result.stats()));
-    if ((scored.isEmpty() && meta.revision == 0) || signature.equals(meta.signature)) {
+    boolean longTerm = watermark >= start + config.windowSizeMillis + config.latenessMillis
+        && (!config.historyCompare || ready);
+    if ((scored.isEmpty() && meta.revision == 0) || (signature.equals(meta.signature) && !longTerm)) {
       LOG.debug(
           "Fixed window snapshot suppressed: family={}, windowStart={}, signals={}",
           family,
@@ -274,7 +290,7 @@ public class WindowMiningFunction extends KeyedProcessFunction<String, Event, St
     }
     String windowStart = Instant.ofEpochMilli(start).toString();
     String windowEnd = Instant.ofEpochMilli(start + config.windowSizeMillis).toString();
-    String status = meta.revision == 0 ? "FINAL" : "CORRECTED";
+    String status = longTerm ? "LTS" : meta.revision == 0 ? "FINAL" : "CORRECTED";
     meta.revision++;
     TreeSet<String> currentIds = new TreeSet<>();
     List<Map<String, Object>> decorated = new ArrayList<>();
@@ -295,6 +311,7 @@ public class WindowMiningFunction extends KeyedProcessFunction<String, Event, St
     }
     meta.ids = new ArrayList<>(currentIds);
     meta.signature = signature;
+    meta.longTerm = longTerm;
     Map<String, Object> stats = new LinkedHashMap<>(result.stats());
     stats.put("window_start", windowStart);
     stats.put("window_end", windowEnd);
@@ -370,6 +387,7 @@ public class WindowMiningFunction extends KeyedProcessFunction<String, Event, St
     boolean closed;
     boolean timerArmed;
     boolean purgeArmed;
+    boolean longTerm;
     String signature = "";
     List<String> ids = new ArrayList<>();
 
@@ -383,6 +401,8 @@ public class WindowMiningFunction extends KeyedProcessFunction<String, Event, St
           timerArmed,
           "purgeArmed",
           purgeArmed,
+          "longTerm",
+          longTerm,
           "signature",
           signature,
           "ids",
@@ -398,6 +418,7 @@ public class WindowMiningFunction extends KeyedProcessFunction<String, Event, St
       meta.closed = Boolean.TRUE.equals(raw.get("closed"));
       meta.timerArmed = Boolean.TRUE.equals(raw.get("timerArmed"));
       meta.purgeArmed = Boolean.TRUE.equals(raw.get("purgeArmed"));
+      meta.longTerm = Boolean.TRUE.equals(raw.get("longTerm"));
       Object signature = raw.get("signature");
       meta.signature = signature == null ? "" : signature.toString();
       Object ids = raw.get("ids");
