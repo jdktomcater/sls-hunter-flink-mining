@@ -3,6 +3,7 @@ package com.sls.hunter.flink;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
+import java.util.Locale;
 import java.util.regex.Pattern;
 
 /** Linux 行为规则。查询是规则 JSON 里的 Elasticsearch 子集：bool、term、terms、wildcard。 */
@@ -12,6 +13,14 @@ public final class Behavior {
   @SuppressWarnings("unchecked")
   public static List<Map<String, Object>> patterns() {
     return (List<Map<String, Object>>) RuleData.data("tracing_sas_linux").get("BEHAVIOR_PATTERNS");
+  }
+
+  @SuppressWarnings("unchecked")
+  static boolean included(Map<String, Object> pattern, Event event) {
+    List<String> procs = (List<String>) pattern.getOrDefault("exclude_procs", Collections.emptyList());
+    List<String> chains = (List<String>) pattern.getOrDefault("exclude_chains", Collections.emptyList());
+    return !procs.contains(event.s("proc_name").toLowerCase(Locale.ROOT))
+        && !RuleData.containsAny(event.s("cmd_chain").toLowerCase(Locale.ROOT), chains);
   }
 
   /** 一条规则是否命中事件。不支持的查询类型直接失败，避免静默当成未命中。 */

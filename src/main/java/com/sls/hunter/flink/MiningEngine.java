@@ -641,69 +641,53 @@ public final class MiningEngine {
   /**
    * Linux 行为规则。门槛用全量计数；突增分子是过滤后的样本条数，且样本最多 30 条。打开历史对比时，基线只取最近 3 个基线日的单日最大值，不是多日合计。关掉后只保留模式本身，横向新目的地址这条依赖历史，直接跳过。
    */
-  @SuppressWarnings("unchecked")
   private static List<Map<String, Object>> behavior(
       DayBucket targetDay, List<DayBucket> baselineDays, boolean historyCompare) {
+    targetDay.requireCompatibleBehaviorState();
+    for (DayBucket baseline : baselineDays) baseline.requireCompatibleBehaviorState();
     List<Map<String, Object>> signals = new ArrayList<>();
+    Set<String> knownDestinations = historyCompare ? baselineDestinations(baselineDays) : Collections.<String>emptySet();
     for (Map<String, Object> pattern : Behavior.patterns()) {
       String label = pattern.get("label").toString();
-      DayBucket.Aggregate aggregate = targetDay.patterns.get(label);
-      int minimum = ((Number) pattern.getOrDefault("min_count_threshold", 1)).intValue();
-      if (aggregate == null || aggregate.count < minimum) {
-        continue;
-      }
-      List<String> excludedProcs = (List<String>) pattern.getOrDefault("exclude_procs", Collections.emptyList());
-      List<String> excludedChains = (List<String>) pattern.getOrDefault("exclude_chains", Collections.emptyList());
-      List<Event> hits = new ArrayList<>();
-      for (Event event : aggregate.samples) {
-        if (excludedProcs.contains(event.s("proc_name").toLowerCase(Locale.ROOT))) {
-          continue;
-        }
-        if (RuleData.containsAny(event.s("cmd_chain").toLowerCase(Locale.ROOT), excludedChains)) {
-          continue;
-        }
-        hits.add(event);
-      }
       String postFilter = pattern.getOrDefault("post_filter", "").toString();
-      // 样本上限 30，达不到这条后过滤要求的 50，整条规则跳过。
-      if (postFilter.equals("_dns_tunnel_heuristic")) {
-        continue;
+      boolean lateral = postFilter.equals("_lateral_novel_dst");
+      if (lateral && !historyCompare) continue;
+      if (!postFilter.isEmpty() && !lateral && !postFilter.equals("_dns_tunnel_heuristic")) {
+        throw new IllegalArgumentException("Unsupported behavior post-filter: " + postFilter);
       }
-      if (postFilter.equals("_lateral_novel_dst")) {
-        if (!historyCompare) {
-          continue;
+      int minimum = ((Number) pattern.getOrDefault("min_count_threshold", 1)).intValue();
+      Map<String, Map<String, DayBucket.Aggregate>> hosts =
+          targetDay.behaviorHosts.getOrDefault(label, Collections.emptyMap());
+      for (Map.Entry<String, Map<String, DayBucket.Aggregate>> host : hosts.entrySet()) {
+        DayBucket.Aggregate hits = behaviorCount(host.getValue(), lateral ? knownDestinations : Collections.<String>emptySet());
+        if (hits.count < minimum || hits.samples.isEmpty()) continue;
+        long baselineMax = 0;
+        if (historyCompare) {
+          for (DayBucket day : baselineDays.subList(0, Math.min(3, baselineDays.size()))) {
+            Map<String, DayBucket.Aggregate> groups = day.behaviorHosts
+                .getOrDefault(label, Collections.emptyMap()).getOrDefault(host.getKey(), Collections.emptyMap());
+            baselineMax = Math.max(baselineMax,
+                behaviorCount(groups, lateral ? knownDestinations : Collections.<String>emptySet()).count);
+          }
         }
-        Set<String> knownDestinations = baselineDestinations(baselineDays);
-        hits.removeIf(event -> seenOrExternal(event, knownDestinations));
-      }
-      if (hits.isEmpty()) {
-        continue;
-      }
-      long baselineMax = 0;
-      double ratio = hits.size();
-      if (historyCompare) {
-        baselineMax =
-            baselineDays.stream()
-                .limit(3)
-                .mapToLong(day -> day.patterns.getOrDefault(label, new DayBucket.Aggregate()).count)
-                .max()
-                .orElse(0);
-        ratio = hits.size() / (baselineMax + 1.0);
-        if (baselineMax > 0 && ratio < 2) {
-          continue;
-        }
-      }
-      Map<String, List<Event>> byHost = new TreeMap<>();
-      for (Event event : hits) {
-        byHost.computeIfAbsent(event.s("host_ip"), key -> new ArrayList<>()).add(event);
-      }
-      for (Map.Entry<String, List<Event>> entry : byHost.entrySet()) {
-        signals.add(
-            behaviorSignal(
-                pattern, label, entry.getKey(), entry.getValue(), baselineMax, ratio, historyCompare));
+        double ratio = historyCompare ? hits.count / (baselineMax + 1.0) : hits.count;
+        if (historyCompare && baselineMax > 0 && ratio < 2) continue;
+        signals.add(behaviorSignal(pattern, label, host.getKey(), hits.samples, hits.count,
+            baselineMax, ratio, historyCompare));
       }
     }
     return signals;
+  }
+
+  private static DayBucket.Aggregate behaviorCount(
+      Map<String, DayBucket.Aggregate> groups, Set<String> excludedDestinations) {
+    DayBucket.Aggregate result = new DayBucket.Aggregate();
+    for (Map.Entry<String, DayBucket.Aggregate> group : groups.entrySet()) {
+      if (!group.getKey().isEmpty() && excludedDestinations.contains(group.getKey())) continue;
+      result.count += group.getValue().count;
+      for (Event event : group.getValue().samples) DayBucket.keep(result.samples, event, 30, false);
+    }
+    return result;
   }
 
   /** 最近 3 个基线日里，横向移动样本出现过的目的地址。 */
@@ -726,7 +710,7 @@ public final class MiningEngine {
    * 丢掉没有新内网目的地址的样本。没有 IP 时只保留命令行里带 @ 的；有 IP 时必须是没见过的
    * 10/172/192.168/100 段。
    */
-  private static boolean seenOrExternal(Event event, Set<String> knownDestinations) {
+  static boolean seenOrExternal(Event event, Set<String> knownDestinations) {
     String ip = event.s("dst_ip");
     if (ip.isEmpty()) {
       return !event.s("cmdline").contains("@");
@@ -743,6 +727,7 @@ public final class MiningEngine {
       String label,
       String host,
       List<Event> events,
+      long hitCount,
       long baselineMax,
       double ratio,
       boolean historyCompare) {
@@ -751,7 +736,7 @@ public final class MiningEngine {
     if (historyCompare) {
       score += (baselineMax == 0 ? 15 : 0) + (ratio >= 5 ? 10 : ratio >= 3 ? 5 : 0);
     }
-    score += Math.min(events.size() * 2, 15);
+    score += Math.min(hitCount * 2, 15);
     Map<String, Object> row =
         signal(
             "behavior_pattern",
@@ -762,7 +747,7 @@ public final class MiningEngine {
     row.put("behavior_label", label);
     row.put("description", pattern.get("description"));
     row.put("severity", severity);
-    row.put("hit_count", events.size());
+    row.put("hit_count", hitCount);
     if (historyCompare) {
       row.put("baseline_max_count", baselineMax);
       row.put("is_novel", baselineMax == 0);

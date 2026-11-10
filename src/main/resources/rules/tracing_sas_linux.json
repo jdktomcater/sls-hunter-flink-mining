@@ -144,7 +144,7 @@
     },
     {
       "label": "dns_high_freq_suspicious",
-      "description": "nslookup/dig 高频查询可疑子域名模式",
+      "description": "单主机 nslookup/dig/host 查询次数达到阈值",
       "severity": "medium",
       "query": {
         "bool": {

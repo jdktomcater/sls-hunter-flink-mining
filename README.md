@@ -61,7 +61,11 @@ java -cp target/sls-hunter-flink-mining-1.0.0-SNAPSHOT.jar \
 
 业务日固定 +08:00，基线是前 N 个日历日。为兼容旧查询，`23:59:59.000` 之后的当日亚秒事件被排除。采样使用事件时间最早 8/12 条；同时间戳以 event_id 打破不确定顺序。原始日志按天保留身份去重，样本按实体有界保留。
 
-状态为 Flink 托管状态（JSON schema v1），包括日桶、去重身份、上次快照、修订号和定时器。固定 operator UID/maxParallelism；升级从 Savepoint 恢复，不跳过旧状态。持久化 checkpoint 路径和 transaction prefix 必须按环境配置。
+状态为 Flink 托管状态（JSON schema v1），包括日桶、去重身份、上次快照、修订号和定时器。固定 operator UID/maxParallelism；兼容的升级从 Savepoint 恢复，不跳过旧状态。持久化 checkpoint 路径和 transaction prefix 必须按环境配置。
+
+行为规则使用规则和主机维度的完整命中计数，排除条件在计数前生效；历史比较使用同一主机最近三个基线日的最大计数。DNS 高频规则按单主机每天至少 50 次 `nslookup`、`dig` 或 `host` 事件触发，不分析域名特征。横向移动在目标地址过滤后计数；证据样本仍有上限。输出上限仍可能截断信号。
+
+**行为计数升级需要从输入重新回放。** 旧 savepoint 中的行为桶只有全族计数和有限样本，无法还原各主机或目的地址的完整计数；读到这类非空旧状态时作业会明确失败，不能直接从旧 savepoint 升级。请使用新的消费组、checkpoint 和隔离输出，从所需基线期开始回放并核验后再切换。新计数按主机和横向目的地址保存，状态大小需要在生产数据量下评估。
 
 `MiningJob` checkpoint 超时的配置、优化边界与上线验证见 [checkpoint 排查说明](docs/checkpoint-tuning.md)。
 

@@ -36,6 +36,8 @@ public class DayBucket {
   public Map<String, Aggregate> uris = new TreeMap<>();
   public Map<String, Aggregate> upstreams = new TreeMap<>();
   public Map<String, Aggregate> patterns = new TreeMap<>();
+  /** Full counts by rule, host and (for lateral movement) destination. */
+  public Map<String, Map<String, Map<String, Aggregate>>> behaviorHosts = new TreeMap<>();
   /** Fixed-window high-risk matches, keyed by rule and host, counted before sampling. */
   public Map<String, Aggregate> windowHighRisk = new TreeMap<>();
   public Map<String, Aggregate> windowStructural = new TreeMap<>();
@@ -75,6 +77,7 @@ public class DayBucket {
   }
 
   public boolean add(Event event, boolean legacyDayBoundary) {
+    requireCompatibleBehaviorState();
     LocalTime local = Instant.ofEpochMilli(event.time).atZone(Event.ZONE).toLocalTime();
     if (legacyDayBoundary && local.toSecondOfDay() == LAST_SECOND_OF_DAY && local.getNano() > 0) {
       return false;
@@ -128,14 +131,25 @@ public class DayBucket {
       return;
     }
     for (Map<String, Object> pattern : Behavior.patterns()) {
-      if (Behavior.matches(pattern.get("query"), event)) {
-        patterns
-            .computeIfAbsent(pattern.get("label").toString(), key -> new Aggregate())
-            .add(event, PATTERN_SAMPLES);
+      if (Behavior.matches(pattern.get("query"), event) && Behavior.included(pattern, event)) {
+        String group = "";
+        if ("_lateral_novel_dst".equals(pattern.get("post_filter"))) {
+          if (MiningEngine.seenOrExternal(event, java.util.Collections.<String>emptySet())) continue;
+          group = event.s("dst_ip");
+        }
+        behaviorHosts.computeIfAbsent(pattern.get("label").toString(), key -> new TreeMap<>())
+            .computeIfAbsent(event.s("host_ip"), key -> new TreeMap<>())
+            .computeIfAbsent(group, key -> new Aggregate()).add(event, PATTERN_SAMPLES);
       }
     }
     if (LATERAL_PROCS.contains(event.s("proc_name"))) {
       keep(lateralLatest, event, LATERAL_LATEST, true);
+    }
+  }
+
+  void requireCompatibleBehaviorState() {
+    if (!patterns.isEmpty()) {
+      throw new IllegalStateException("Legacy behavior state lacks per-host counts; replay input into a fresh state");
     }
   }
 }

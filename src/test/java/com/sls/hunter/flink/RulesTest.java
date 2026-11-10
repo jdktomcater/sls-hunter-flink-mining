@@ -101,6 +101,81 @@ class RulesTest {
   }
 
   @Test
+  void dnsThresholdUsesFullCountPerHost() throws Exception {
+    DayBucket bucket = new DayBucket();
+    for (int i = 0; i < 50; i++) {
+      bucket.add(event("a" + i, "tracing_sas_linux", "2026-06-10", "a", "dig", "dig example.org"));
+      if (i < 49) bucket.add(event("b" + i, "tracing_sas_linux", "2026-06-10", "b", "dig", "dig example.org"));
+    }
+    bucket = Json.MAPPER.readValue(Json.write(bucket), DayBucket.class);
+    Properties p = new Properties();
+    p.setProperty("history.compare", "false");
+    List<Map<String, Object>> rows = MiningEngine.evaluate("tracing_sas_linux", LocalDate.parse("2026-06-10"),
+        Collections.singletonMap("2026-06-10", bucket), new MiningConfig(p)).signals();
+    List<Map<String, Object>> dns = new ArrayList<>();
+    for (Map<String, Object> row : rows) if ("dns_high_freq_suspicious".equals(row.get("behavior_label"))) dns.add(row);
+    assertEquals(1, dns.size());
+    assertEquals("a", dns.get(0).get("host_ip"));
+    assertEquals(50L, dns.get(0).get("hit_count"));
+  }
+
+  @Test
+  void behaviorCountsArePerHostFullAndExcludeBeforeCounting() {
+    DayBucket baseline = new DayBucket(), target = new DayBucket();
+    for (int i = 0; i < 40; i++) {
+      baseline.add(event("base" + i, "tracing_sas_linux", "2026-06-09", "a", "bash", "bash /dev/tcp/x"));
+    }
+    for (int i = 0; i < 100; i++) {
+      Event e = event("target" + i, "tracing_sas_linux", "2026-06-10", "a", "bash", "bash /dev/tcp/x");
+      target.add(e);
+    }
+    target.add(event("other", "tracing_sas_linux", "2026-06-10", "b", "bash", "bash /dev/tcp/x"));
+    for (int i = 0; i < 35; i++) {
+      Event e = event("excluded" + i, "tracing_sas_linux", "2026-06-10", "c", "bash", "cat /etc/cron.d/foo");
+      e.fields.put("cmd_chain", "apt");
+      target.add(e);
+    }
+    target.add(event("included", "tracing_sas_linux", "2026-06-10", "c", "bash", "cat /etc/cron.d/foo"));
+    Map<String, DayBucket> days = new HashMap<>();
+    days.put("2026-06-09", baseline); days.put("2026-06-10", target);
+    List<Map<String, Object>> rows = MiningEngine.evaluate("tracing_sas_linux", LocalDate.parse("2026-06-10"), days, config()).signals();
+    Map<String, Object> a = rows.stream().filter(r -> "reverse_shell".equals(r.get("behavior_label")) && "a".equals(r.get("host_ip"))).findFirst().orElseThrow(IllegalStateException::new);
+    assertEquals(100L, a.get("hit_count"));
+    assertEquals(40L, a.get("baseline_max_count"));
+    assertEquals(2.44, a.get("spike_ratio"));
+    assertTrue(rows.stream().anyMatch(r -> "reverse_shell".equals(r.get("behavior_label")) && "b".equals(r.get("host_ip"))));
+    Map<String, Object> c = rows.stream().filter(r -> "cron_persistence".equals(r.get("behavior_label")) && "c".equals(r.get("host_ip"))).findFirst().orElseThrow(IllegalStateException::new);
+    assertEquals(1L, c.get("hit_count"));
+  }
+
+  @Test
+  void legacyBehaviorStateRequiresReplay() throws Exception {
+    DayBucket old = Json.MAPPER.readValue("{\"patterns\":{\"reverse_shell\":{\"count\":40,\"samples\":[]}}}", DayBucket.class);
+    assertThrows(IllegalStateException.class, () -> old.add(event("a", "tracing_sas_linux", "2026-06-10", "a", "bash", "echo")));
+    assertThrows(IllegalStateException.class, () -> MiningEngine.evaluate("tracing_sas_linux", LocalDate.parse("2026-06-10"), Collections.singletonMap("2026-06-10", old), config()));
+  }
+
+  @Test
+  void lateralCountsOnlyNovelDestinationsAfterSamplingLimit() {
+    DayBucket baseline = new DayBucket(), target = new DayBucket();
+    Event known = event("base", "tracing_sas_linux", "2026-06-09", "a", "ssh", "ssh user@host");
+    known.fields.put("dst_ip", "10.0.0.1");
+    baseline.add(known);
+    for (int i = 0; i < 38; i++) {
+      Event e = event("ssh" + i, "tracing_sas_linux", "2026-06-10", "a", "ssh", "ssh user@host");
+      e.time += i;
+      e.fields.put("dst_ip", i < 35 ? "10.0.0.1" : "10.0.0.2");
+      target.add(e);
+    }
+    Map<String, DayBucket> days = new HashMap<>();
+    days.put("2026-06-09", baseline); days.put("2026-06-10", target);
+    Map<String, Object> row = MiningEngine.evaluate("tracing_sas_linux", LocalDate.parse("2026-06-10"), days, config()).signals().stream()
+        .filter(r -> "ssh_lateral_novel_target".equals(r.get("behavior_label"))).findFirst().orElseThrow(IllegalStateException::new);
+    assertEquals(3L, row.get("hit_count"));
+    assertEquals(0L, row.get("baseline_max_count"));
+  }
+
+  @Test
   void baselineIsSumNotPeak() {
     Map<String, DayBucket> days = new TreeMap<String, DayBucket>();
     for (int d = 5; d <= 9; d++) {
