@@ -51,7 +51,7 @@ public final class WindowMiningJob {
         config.integer("checkpoint.interval.ms", 5000), CheckpointingMode.EXACTLY_ONCE);
     env.getCheckpointConfig().setCheckpointStorage(config.required("checkpoint.storage"));
     env.getCheckpointConfig().setCheckpointTimeout(config.integer("checkpoint.timeout.ms", 120000));
-    env.getCheckpointConfig().setMaxConcurrentCheckpoints(1);
+    MiningJob.configureCheckpointFlow(env.getCheckpointConfig(), config);
     env.getCheckpointConfig()
         .enableExternalizedCheckpoints(
             CheckpointConfig.ExternalizedCheckpointCleanup.RETAIN_ON_CANCELLATION);
@@ -114,6 +114,7 @@ public final class WindowMiningJob {
           table);
       results
           .addSink(PostgresSnapshotSink.createFixed(config))
+          .disableChaining()
           .name("mining-window-fixed-jdbc")
           .uid("window-fixed-jdbc-v1");
     } else {

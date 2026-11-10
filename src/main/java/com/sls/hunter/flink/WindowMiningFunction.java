@@ -34,6 +34,7 @@ public class WindowMiningFunction extends KeyedProcessFunction<String, Event, St
   private transient Counter lateEvents;
   private transient Counter duplicateEvents;
   private static final long DAY_MS = 86_400_000L;
+  private static final long SLOW_STATE_MILLIS = 1000L;
 
   public WindowMiningFunction(MiningConfig config) {
     this.config = config;
@@ -78,6 +79,7 @@ public class WindowMiningFunction extends KeyedProcessFunction<String, Event, St
         ctx.timerService().registerEventTimeTimer(expiry);
         if (alreadySealed) {
           LOG.debug("Fixed-window day already sealed: family={}, day={}", ctx.getCurrentKey(), event.day);
+          return;
         } else {
           LOG.info("Fixed-window day sealed: family={}, day={}", ctx.getCurrentKey(), event.day);
         }
@@ -106,7 +108,7 @@ public class WindowMiningFunction extends KeyedProcessFunction<String, Event, St
       return;
     }
     DayBucket bucket = readBucket(start);
-    if (!bucket.add(event, false)) {
+    if (!(config.historyCompare ? bucket.addWindowHistory(event) : bucket.add(event, false))) {
       duplicateEvents.inc();
       LOG.debug(
           "Input skipped: family={}, windowStart={}, id={}, reason=duplicateIdentity",
@@ -121,7 +123,7 @@ public class WindowMiningFunction extends KeyedProcessFunction<String, Event, St
           ctx.getCurrentKey(), start, bucket.identities.size(), config.integer("max.events.per.family.day", 2000000));
       throw new IllegalStateException("Fixed-window identity capacity exceeded");
     }
-    buckets.put(start, Json.write(bucket));
+    writeBucket(start, bucket);
     Meta meta = meta(start);
     if (meta.closed || watermark >= end) {
       publish(ctx.getCurrentKey(), out, start, bucket, meta, ctx.timerService().currentProcessingTime(), ctx.timerService().currentWatermark());
@@ -145,26 +147,34 @@ public class WindowMiningFunction extends KeyedProcessFunction<String, Event, St
 
   @Override
   public void onTimer(long timestamp, OnTimerContext ctx, Collector<String> out) throws Exception {
-    long closingStart = timestamp - config.windowSizeMillis;
-    if (buckets.contains(closingStart)) close(ctx, out, closingStart, timestamp);
-    long finalStart = timestamp - config.windowSizeMillis - config.latenessMillis;
-    String finalBucket = buckets.get(finalStart);
-    if (finalBucket != null) {
-      Meta meta = meta(finalStart);
-      if (meta.closed && !meta.longTerm) {
-        publish(ctx.getCurrentKey(), out, finalStart, Json.MAPPER.readValue(finalBucket, DayBucket.class),
-            meta, ctx.timerService().currentProcessingTime(), ctx.timerService().currentWatermark());
-        metas.put(finalStart, Json.write(meta.toMap()));
+    long started = System.nanoTime();
+    try {
+      long closingStart = timestamp - config.windowSizeMillis;
+      if (buckets.contains(closingStart)) close(ctx, out, closingStart, timestamp);
+      long finalStart = timestamp - config.windowSizeMillis - config.latenessMillis;
+      String finalBucket = buckets.get(finalStart);
+      if (finalBucket != null) {
+        Meta meta = meta(finalStart);
+        if (meta.closed && !meta.longTerm) {
+          publish(ctx.getCurrentKey(), out, finalStart, readBucket(finalStart),
+              meta, ctx.timerService().currentProcessingTime(), ctx.timerService().currentWatermark());
+          metas.put(finalStart, Json.write(meta.toMap()));
+        }
       }
-    }
-    long retention = config.historyCompare ? (config.baselineDays + 2L) * DAY_MS : 0;
-    long expiringStart = timestamp - config.windowSizeMillis - retention - config.latenessMillis;
-    buckets.remove(expiringStart);
-    metas.remove(expiringStart);
-    if (config.historyCompare) {
-      LocalDate expiryDay = Instant.ofEpochMilli(timestamp).atZone(Event.ZONE).toLocalDate();
-      if (expiryDay.atStartOfDay(Event.ZONE).toInstant().toEpochMilli() == timestamp)
-        sealedDays.remove(expiryDay.minusDays(config.baselineDays + 3L).toString());
+      long retention = config.historyCompare ? (config.baselineDays + 2L) * DAY_MS : 0;
+      long expiringStart = timestamp - config.windowSizeMillis - retention - config.latenessMillis;
+      buckets.remove(expiringStart);
+      metas.remove(expiringStart);
+      if (config.historyCompare) {
+        LocalDate expiryDay = Instant.ofEpochMilli(timestamp).atZone(Event.ZONE).toLocalDate();
+        if (expiryDay.atStartOfDay(Event.ZONE).toInstant().toEpochMilli() == timestamp)
+          sealedDays.remove(expiryDay.minusDays(config.baselineDays + 3L).toString());
+      }
+    } finally {
+      long elapsed = (System.nanoTime() - started) / 1_000_000;
+      if (elapsed >= SLOW_STATE_MILLIS)
+        LOG.warn("Slow fixed-window timer: family={}, timestamp={}, elapsedMillis={}",
+            ctx.getCurrentKey(), timestamp, elapsed);
     }
   }
 
@@ -177,7 +187,7 @@ public class WindowMiningFunction extends KeyedProcessFunction<String, Event, St
     if (meta.closed) {
       return;
     }
-    DayBucket bucket = Json.MAPPER.readValue(stored, DayBucket.class);
+    DayBucket bucket = readBucket(start);
     publish(ctx.getCurrentKey(), out, start, bucket, meta, ctx.timerService().currentProcessingTime(), ctx.timerService().currentWatermark());
     meta.closed = true;
     remember(ctx, start, end, meta, ctx.timerService().currentWatermark());
@@ -210,6 +220,8 @@ public class WindowMiningFunction extends KeyedProcessFunction<String, Event, St
 
   /** Re-evaluate retained closed windows when a seal or a still-admissible baseline changes. */
   private void recomputeClosed(Context ctx, Collector<String> out) throws Exception {
+    long started = System.nanoTime();
+    int evaluated = 0;
     List<Long> starts = new ArrayList<>();
     for (Long start : buckets.keys()) starts.add(start);
     for (Long start : starts) {
@@ -217,18 +229,25 @@ public class WindowMiningFunction extends KeyedProcessFunction<String, Event, St
       if (meta.closed && ctx.timerService().currentWatermark() < start + config.windowSizeMillis + 2L * DAY_MS + config.latenessMillis) {
         publish(ctx.getCurrentKey(), out, start, readBucket(start), meta, ctx.timerService().currentProcessingTime(), ctx.timerService().currentWatermark());
         metas.put(start, Json.write(meta.toMap()));
+        evaluated++;
       }
     }
+    long elapsed = (System.nanoTime() - started) / 1_000_000;
+    if (elapsed >= SLOW_STATE_MILLIS)
+      LOG.warn("Slow fixed-window seal recomputation: family={}, scanned={}, evaluated={}, elapsedMillis={}",
+          ctx.getCurrentKey(), starts.size(), evaluated, elapsed);
   }
 
   private void recomputeDependents(Context ctx, Collector<String> out, long baselineStart) throws Exception {
+    // No later same-time window can be closed before this point.
+    if (ctx.timerService().currentWatermark() < baselineStart + DAY_MS + config.windowSizeMillis) return;
     for (int age = 1; age <= config.baselineDays; age++) {
       long start = baselineStart + age * DAY_MS;
       String stored = buckets.get(start);
       if (stored == null) continue;
       Meta meta = meta(start);
       if (meta.closed && ctx.timerService().currentWatermark() < start + config.windowSizeMillis + 2L * DAY_MS + config.latenessMillis) {
-        publish(ctx.getCurrentKey(), out, start, Json.MAPPER.readValue(stored, DayBucket.class), meta,
+        publish(ctx.getCurrentKey(), out, start, readBucket(start), meta,
             ctx.timerService().currentProcessingTime(), ctx.timerService().currentWatermark());
         metas.put(start, Json.write(meta.toMap()));
       }
@@ -372,8 +391,30 @@ public class WindowMiningFunction extends KeyedProcessFunction<String, Event, St
   }
 
   private DayBucket readBucket(long start) throws Exception {
+    long started = System.nanoTime();
     String stored = buckets.get(start);
-    return stored == null ? new DayBucket() : Json.MAPPER.readValue(stored, DayBucket.class);
+    DayBucket bucket = stored == null ? new DayBucket() : Json.MAPPER.readValue(stored, DayBucket.class);
+    if (config.historyCompare && stored != null && bucket.compactWindowHistory()) {
+      writeBucket(start, bucket);
+    }
+    if (!config.historyCompare && Boolean.TRUE.equals(bucket.windowHistoryCompact)) {
+      throw new IllegalStateException("Compact fixed-window history state cannot be used by full rules; replay input into fresh state");
+    }
+    long elapsed = (System.nanoTime() - started) / 1_000_000;
+    if (elapsed >= SLOW_STATE_MILLIS)
+      LOG.warn("Slow fixed-window state read: windowStart={}, chars={}, elapsedMillis={}", start,
+          stored == null ? 0 : stored.length(), elapsed);
+    return bucket;
+  }
+
+  private void writeBucket(long start, DayBucket bucket) throws Exception {
+    long started = System.nanoTime();
+    String value = Json.write(bucket);
+    buckets.put(start, value);
+    long elapsed = (System.nanoTime() - started) / 1_000_000;
+    if (elapsed >= SLOW_STATE_MILLIS)
+      LOG.warn("Slow fixed-window state write: windowStart={}, events={}, chars={}, elapsedMillis={}",
+          start, bucket.events, value.length(), elapsed);
   }
 
   private Meta meta(long start) throws Exception {

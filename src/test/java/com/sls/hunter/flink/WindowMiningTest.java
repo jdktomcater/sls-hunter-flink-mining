@@ -10,9 +10,13 @@ import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
+import org.apache.flink.api.common.state.MapState;
+import org.apache.flink.api.common.state.MapStateDescriptor;
 import org.apache.flink.api.common.typeinfo.Types;
 import org.apache.flink.api.java.functions.KeySelector;
 import org.apache.flink.runtime.checkpoint.OperatorSubtaskState;
+import org.apache.flink.runtime.state.VoidNamespace;
+import org.apache.flink.runtime.state.VoidNamespaceSerializer;
 import org.apache.flink.streaming.api.operators.KeyedProcessOperator;
 import org.apache.flink.streaming.api.watermark.Watermark;
 import org.apache.flink.streaming.runtime.streamrecord.StreamRecord;
@@ -457,6 +461,104 @@ class WindowMiningTest {
         Collections.singletonList(baseline), true, historyConfig()).signals().stream()
         .filter(s -> "window_novel_template".equals(s.get("signal_type"))).findFirst().orElseThrow(IllegalStateException::new);
     assertEquals(Collections.singletonList("echo novel"), row.get("novel_templates"));
+  }
+
+  @Test
+  void compactWindowHistoryPreservesResultsAndRejectsFullMode() throws Exception {
+    long start = Instant.parse("2026-06-10T02:00:00Z").toEpochMilli();
+    DayBucket legacy = new DayBucket();
+    for (int i = 0; i < 80; i++) {
+      Event e = at("sample" + i, start + i, "h", "bash", i == 79 ? SHELL : "echo normal");
+      legacy.add(e, false);
+      WindowMining.recordHighRisk(legacy, e);
+    }
+    MiningConfig config = historyConfig();
+    String expected = Json.write(WindowMining.evaluateChannels("tracing_sas_linux", legacy,
+        Collections.singletonList(new DayBucket()), true, config).signals());
+    String previousState = Json.write(legacy);
+    DayBucket restored = Json.MAPPER.readValue(previousState, DayBucket.class);
+    assertTrue(restored.compactWindowHistory());
+    assertTrue(Json.write(restored).length() < previousState.length());
+    assertEquals(expected, Json.write(WindowMining.evaluateChannels("tracing_sas_linux", restored,
+        Collections.singletonList(new DayBucket()), true, config).signals()));
+    DayBucket compact = Json.MAPPER.readValue(Json.write(restored), DayBucket.class);
+    assertThrows(IllegalStateException.class, () -> WindowMining.evaluate("tracing_sas_linux", compact,
+        LocalDate.parse("2026-06-10"), config(60_000, 0, 0)));
+    assertTrue(compact.addWindowHistory(at("more", start + 100, "h", "bash", "echo later")));
+    assertEquals(81L, compact.events);
+    assertTrue(compact.triples.values().iterator().next().scoringEvents.isEmpty());
+  }
+
+  @Test
+  void windowHistoryStoresCompleteTemplatesWithoutFullScoringEvents() throws Exception {
+    long start = Instant.parse("2026-06-10T02:00:00Z").toEpochMilli();
+    DayBucket compact = new DayBucket();
+    for (int i = 0; i < 20; i++) {
+      Event e = at("event" + i, start + i, "h", "echo", i == 19 ? "echo novel" : "echo ordinary");
+      assertTrue(compact.addWindowHistory(e));
+      WindowMining.recordHighRisk(compact, e);
+    }
+    DayBucket restored = Json.MAPPER.readValue(Json.write(compact), DayBucket.class);
+    Map<String, Object> row = WindowMining.evaluateChannels("tracing_sas_linux", restored,
+        Collections.singletonList(new DayBucket()), true, historyConfig()).signals().stream()
+        .filter(s -> "window_novel_template".equals(s.get("signal_type"))).findFirst().orElseThrow(IllegalStateException::new);
+    assertTrue(((List<?>) row.get("novel_templates")).contains("echo novel"));
+    assertTrue(restored.triples.values().iterator().next().scoringEvents.isEmpty());
+    assertEquals(20L, restored.events);
+  }
+
+  @Test
+  void compactWindowHistoryPreservesNginxResults() throws Exception {
+    long start = Instant.parse("2026-06-10T02:00:00Z").toEpochMilli();
+    DayBucket legacy = new DayBucket(), compact = new DayBucket();
+    for (int i = 0; i < 4; i++) {
+      Event e = at("nginx" + i, start + i, "h", "", "");
+      e.family = "tracing_nginx_hertzbeat";
+      e.fields.put("uri", "/api/42"); e.fields.put("upstream_addr", "10.0.0.1:80");
+      legacy.add(e, false); compact.addWindowHistory(e);
+    }
+    assertEquals(Json.write(WindowMining.evaluateChannels("tracing_nginx_hertzbeat", legacy,
+            Collections.singletonList(new DayBucket()), true, historyConfig()).signals()),
+        Json.write(WindowMining.evaluateChannels("tracing_nginx_hertzbeat", compact,
+            Collections.singletonList(new DayBucket()), true, historyConfig()).signals()));
+  }
+
+  @Test
+  void legacyWindowStateCompactsAndSurvivesCheckpointRestore() throws Exception {
+    long start = Instant.parse("2026-06-10T02:00:00Z").toEpochMilli();
+    MiningConfig settings = historyConfig();
+    DayBucket legacy = new DayBucket();
+    Event initial = at("legacy", start, "h", "bash", SHELL);
+    legacy.add(initial, false);
+    WindowMining.recordHighRisk(legacy, initial);
+    OperatorSubtaskState checkpoint;
+    try (KeyedOneInputStreamOperatorTestHarness<String, Event, String> h = harness(settings)) {
+      h.open();
+      h.getOperator().setCurrentKey("tracing_sas_linux");
+      MapState<Long, String> state = h.getOperator().getKeyedStateBackend().getPartitionedState(
+          VoidNamespace.INSTANCE, VoidNamespaceSerializer.INSTANCE,
+          new MapStateDescriptor<Long, String>("fixed-window-bucket-v1", Long.class, String.class));
+      state.put(start, Json.write(legacy));
+      send(h, at("new", start + 1, "h", "bash", SHELL));
+      DayBucket stored = Json.MAPPER.readValue(state.get(start), DayBucket.class);
+      assertEquals(Boolean.TRUE, stored.windowHistoryCompact);
+      assertEquals(2L, stored.events);
+      assertTrue(stored.triples.values().iterator().next().scoringEvents.isEmpty());
+      checkpoint = h.snapshot(13, start + 2);
+    }
+    try (KeyedOneInputStreamOperatorTestHarness<String, Event, String> h = harness(settings)) {
+      h.initializeState(checkpoint); h.open();
+      h.processWatermark(new Watermark(start + 60000));
+      Map<String, Object> snapshot = Json.map(h.extractOutputValues().get(0));
+      Map<String, Object> row = signals(snapshot).stream()
+          .filter(s -> "reverse_shell".equals(s.get("behavior_label")))
+          .findFirst().orElseThrow(IllegalStateException::new);
+      assertEquals(2L, ((Number) row.get("hit_count")).longValue());
+    }
+    try (KeyedOneInputStreamOperatorTestHarness<String, Event, String> h = harness(config(60_000, 10_000, 0))) {
+      h.initializeState(checkpoint); h.open();
+      assertThrows(IllegalStateException.class, () -> send(h, at("mode-switch", start + 2, "h", "bash", SHELL)));
+    }
   }
 
   @Test

@@ -19,6 +19,8 @@ final class WindowMining {
   }
 
   static MiningEngine.Result evaluate(String family, DayBucket bucket, LocalDate day, MiningConfig config) {
+    if (Boolean.TRUE.equals(bucket.windowHistoryCompact))
+      throw new IllegalStateException("Compact fixed-window history state cannot be used by full rules; replay input into fresh state");
     Map<String, DayBucket> days = new HashMap<>();
     days.put(day.toString(), bucket);
     return MiningEngine.evaluate(family, day, days, config);

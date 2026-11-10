@@ -37,6 +37,8 @@ public class DayBucket {
   public Map<String, Map<String, Map<String, Aggregate>>> behaviorHosts = new TreeMap<>();
   /** Null on state written before the current behavior matching rules. */
   public Integer behaviorRulesVersion;
+  /** True when the fixed-window history mode has discarded day-only scoring state. */
+  public Boolean windowHistoryCompact;
   /** Fixed-window high-risk matches, keyed by rule and host, counted before sampling. */
   public Map<String, Aggregate> windowHighRisk = new TreeMap<>();
   public Map<String, Aggregate> windowStructural = new TreeMap<>();
@@ -85,6 +87,12 @@ public class DayBucket {
       if (!chain.isEmpty()) chainSignatures.merge(chain, 1, Integer::sum);
     }
 
+    void addWindowTriple(Event event) {
+      add(event, TRIPLE_SAMPLES);
+      if (event.s("cmdline").trim().length() >= 4)
+        commandTemplates.merge(Templates.command(event.s("cmdline")), 1, Integer::sum);
+    }
+
     List<Event> orderedScoringEvents() {
       List<Event> ordered = new ArrayList<>(scoringEvents);
       ordered.sort(Event.ORDER);
@@ -107,7 +115,19 @@ public class DayBucket {
   }
 
   public boolean add(Event event, boolean legacyDayBoundary) {
+    return add(event, legacyDayBoundary, false);
+  }
+
+  /** History-mode windows use only counts, command templates and separately recorded high-risk hits. */
+  boolean addWindowHistory(Event event) {
+    return add(event, false, true);
+  }
+
+  private boolean add(Event event, boolean legacyDayBoundary, boolean windowHistory) {
     requireCompatibleBehaviorState();
+    if (!windowHistory && Boolean.TRUE.equals(windowHistoryCompact)) {
+      throw new IllegalStateException("Compact fixed-window history state cannot be used by full rules; replay input into fresh state");
+    }
     behaviorRulesVersion = 4;
     LocalTime local = Instant.ofEpochMilli(event.time).atZone(Event.ZONE).toLocalTime();
     if (legacyDayBoundary && local.toSecondOfDay() == LAST_SECOND_OF_DAY && local.getNano() > 0) {
@@ -117,6 +137,16 @@ public class DayBucket {
       return false;
     }
     events++;
+    if (windowHistory) {
+      windowHistoryCompact = true;
+      if (event.family.equals("tracing_nginx_hertzbeat")) {
+        addNginx(event);
+      } else if (event.fields.get("username") != null && event.fields.get("proc_name") != null
+          && event.fields.get("host_ip") != null) {
+        triples.computeIfAbsent(event.triple(), key -> new Aggregate()).addWindowTriple(event);
+      }
+      return true;
+    }
     if (event.fields.get("host_ip") != null) {
       hosts.merge(event.s("host_ip"), 1L, Long::sum);
       keep(
@@ -135,6 +165,20 @@ public class DayBucket {
     } else {
       addSas(event);
     }
+    return true;
+  }
+
+  /** Drop fields unused in fixed-window history mode; preserves all of that mode's outputs. */
+  boolean compactWindowHistory() {
+    requireCompatibleBehaviorState();
+    if (events == 0 || Boolean.TRUE.equals(windowHistoryCompact)) return false;
+    hosts.clear(); procHosts.clear(); firstHost.clear(); fetchLatest.clear();
+    fetchParentPaths.clear(); lateralLatest.clear(); behaviorHosts.clear();
+    for (Aggregate triple : triples.values()) {
+      triple.scoringEvents.clear();
+      triple.chainSignatures.clear();
+    }
+    windowHistoryCompact = true;
     return true;
   }
 
