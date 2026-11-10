@@ -1,0 +1,328 @@
+h1. SLS Hunter Flink Mining 系统设计
+
+|| 文档属性 || 内容 ||
+| 版本 | 1.0（基于当前工作区源码和配置） |
+| 更新日期 | 2026-11-10 |
+| 系统 | SLS Hunter Flink Mining |
+| 文档范围 | 日历日检测、固定时间窗口检测、数据契约、规则、状态、部署与验证 |
+| 依据 | {{src/main/java/com/sls/hunter/flink}}、{{src/main/resources/rules}}、{{conf}}、{{deploy}}、{{src/test}} |
+| 状态说明 | 描述已实现代码和仓库配置；不代表当前集群已部署这些版本，也不代表生产容量或检测效果已验证。 |
+
+{toc:maxLevel=3}
+
+h2. 1. 背景与目标
+
+系统消费 SAS 安全日志和可选 Nginx 日志，通过命令结构、行为模式和历史差异生成可修订的检测信号。Flink 承担流处理与状态恢复，Kafka 承担输入与结果传递，Dinky 用于提交作业，PostgreSQL 可保存窗口快照。
+
+*业务目标*
+* 识别命令执行、持久化、凭证访问、隧道及其他可疑行为。
+* 对具备历史数据的场景识别新增实体、模板和数量突增。
+* 输出具备版本、修订号和撤回信息的可消费快照。
+* 支持事件去重、迟到修订和 checkpoint 恢复。
+
+*范围边界*
+* 检测结果是启发式线索，不直接等同于攻击确认。
+* 当前不是 Sigma 规则引擎，不能直接加载 Sigma YAML；没有实现跨事件 Sigma correlation。
+* 日作业与固定窗口作业是两套独立的计算口径，不能认为结果完全相同。
+* 不支持源文档原地更新或删除；输入按 append-only 处理。
+* 旧 HDFS 五文件和 {{agent_bundle}} 报告封装未迁移；当前输出不能直接替代依赖旧格式的消费者。
+
+h2. 2. 技术栈与组成
+
+|| 组件 || 当前实现 || 职责 ||
+| Java | Java 8 | 规则、归一化和数据处理 |
+| 流处理 | Flink 1.18.1 DataStream | Kafka 消费、状态、定时器、checkpoint 和输出 |
+| 状态后端 | Embedded RocksDBStateBackend | 托管状态与持久化 checkpoint |
+| 消息系统 | Kafka | 输入、结果、DLQ 和迟到数据 |
+| 作业管理 | Dinky EXECUTE JAR | 提交同一 JAR 的不同入口 |
+| 数据库 | PostgreSQL，可选 JDBC Sink | 按窗口主键与 revision 保存快照 |
+| 本地回放 | ReplayJob | 文件输入的有界日规则评估，不连接 Kafka |
+
+h3. 2.1 逻辑架构
+
+{code}
+上游采集/规范化
+   |
+   | Kafka：SAS Linux / Windows / Jumper / 可选 Nginx
+   v
+解析、身份与时间校验 -----> DLQ
+   |
+   +------------------------+-------------------------+
+   |                                                  |
+   v                                                  v
+MiningJob（日历日）                            WindowMiningJob（固定窗口）
+keyBy family                                  keyBy family / 窗口状态
+待处理状态 / 日桶 / 规则与历史                   高危通道 / 同时段历史通道
+   |                                                  |
+   +---- 迟到数据 -> 各自 late topic                    +---- 迟到数据 -> 各自 late topic
+   |                                                  |
+   v                                                  v
+日快照 Kafka topic                            固定窗口快照 Kafka topic
+   |                                                  |
+   +---- 可选 JDBC -> mining_window                    +---- 可选 JDBC -> mining_window_fixed
+
+两条作业使用独立的消费组、事务前缀和状态；Kafka 结果事务由 checkpoint 提交。
+{code}
+
+说明：固定窗口算子实际先按 {{family}} 分键，再以窗口起始时间作为该键内的状态索引；不是按每个窗口独立 {{keyBy}}。同一族仍由一个逻辑键处理。
+
+h3. 2.2 代码模块
+
+|| 模块 || 主要职责 ||
+| {{MiningJob}} / {{MiningProcessFunction}} | 日作业接入、按族聚合、批量刷新、封账、快照修订 |
+| {{WindowMiningJob}} / {{WindowMiningFunction}} / {{WindowMining}} | 事件时间窗口、水位线、历史封账、双通道计算与修订 |
+| {{Event}} / {{DayBucket}} | 输入解析、事件身份、时间与字段归一化、去重和聚合状态 |
+| {{MiningEngine}} / {{Scoring}} / {{Whitelist}} | 日规则、历史差分、评分、降分和信号排序 |
+| {{Behavior}} / {{RuleData}} / {{Templates}} / {{IpAddresses}} | 行为匹配、规则加载、模板归一化和地址分类 |
+| {{PostgresSnapshots}} / {{PostgresSnapshotSink}} | 建表、窗口快照绑定和条件 upsert |
+| {{ReplayJob}} | 本地 JSON Lines 日规则回放 |
+
+h2. 3. 输入与数据契约
+
+h3. 3.1 族、Topic 和路由
+
+代码支持 {{tracing_sas_linux}}、{{tracing_sas_win}}、{{tracing_sas_jumper}}、{{tracing_nginx_hertzbeat}} 四族。仓库中的两份实际作业配置仅订阅三个 SAS 测试 topic；代码支持 Nginx 不代表当前配置已订阅它。
+
+推荐消息以 {{index_family}} 为 Kafka key。对需要历史完整性的流，同族 {{EVENT}}、{{FLEET}}、{{SEAL}} 必须通过同一有序发布链路进入同一分区；多个相互独立的生产者发出 SEAL 无法证明来源完整。
+
+h3. 3.2 输入种类
+
+|| kind || 内容 || 处理语义 ||
+| {{EVENT}}（默认） | 安全或访问日志 | 归一化、按时间及身份入桶；仅支持追加 |
+| {{SEAL}} | 某族某业务日的数据完整性声明 | 上游核验后发送；日历史与固定窗口历史就绪依赖该声明 |
+| {{FLEET}} | 按目标日统计的进程主机数快照 | 日作业 legacy_snapshot 模式使用；固定窗口作业忽略 |
+
+事件示例：
+{code:language=json}
+{"index_family":"tracing_sas_linux","event_id":"source-index:doc-id","payload":{"@timestamp":"2026-06-10T12:00:00+08:00","host_ip":"10.0.0.2","username":"root","proc_name":"curl","cmdline":"curl http://example.org/a","cmd_chain":"[]"}}
+{code}
+
+封账和 fleet 示例：
+{code:language=json}
+{"index_family":"tracing_sas_linux","kind":"SEAL","day":"2026-06-09"}
+{"index_family":"tracing_sas_linux","kind":"FLEET","day":"2026-06-10","values":{"curl":12,"bash":80}}
+{code}
+
+h3. 3.3 身份、时间与质量控制
+
+* 身份优先使用 {{event_id}}，其次使用 {{source_index}} + {{source_id}}，再其次是 {{_id}}/{{id}}；Kafka 输入还可回退到 topic、partition、offset。显式稳定源身份能支持源端重放去重；仅依赖 Kafka 偏移无法跨重新发布去重。
+* 时间优先使用 payload {{@timestamp}}，再尝试 {{event_time}}、{{start_time}}、{{proc_start_time}}；业务日使用 UTC+08:00。
+* 缺失必要身份、无法解析的时间、未知族以及超过允许未来时钟偏差的输入进入 DLQ。
+* 事件以族和日或族和固定窗口内的身份去重；达到配置的身份数上限时显式失败。
+* 日桶为兼容旧逻辑，排除当地 {{23:59:59.000}} 之后的当日亚秒事件；固定窗口不使用该日末截断。
+* 三元组聚合依赖 {{host_ip}}、{{username}}、{{proc_name}} 字段存在；存在但为空字符串仍按现有实现处理。
+
+h2. 4. 日历日检测设计
+
+h3. 4.1 数据流
+
+# Kafka 读取、解析并按 {{family}} 分键。
+# 事件先写入 Flink 托管的待处理状态，处理时间定时器按配置分批折叠到日桶，避免未刷新的数据不随 checkpoint 恢复。
+# 日桶维护身份、主机、三元组、命令模板、父链、行为模式及其他聚合。
+# 根据目标日期、历史开关、基线封账和 fleet 可用性评估就绪日期。
+# 对结果计算签名；内容或状态变化时，生成递增 revision 的完整快照。
+# 根据已观察到的最新业务日清理超过在线保留期的状态，超范围输入进入 late topic。
+
+h3. 4.2 当前配置与历史开关
+
+|| 项目 || 仓库日作业配置 || 说明 ||
+| {{history.compare}} | {{false}} | 不等待历史 SEAL 或 fleet；保留结构规则与 Linux 行为规则 |
+| {{baseline.days}} | 5 | 开启历史对比后使用前 5 个日历日 |
+| {{min.count}} | 2 | 用于历史候选等；不应误解为所有行为规则都要两条 |
+| {{max.signals}} | 200 | 参与 deep 名额和最终输出上限计算 |
+| {{emit.interval.ms}} | 1000 | 日作业刷新调度间隔，不是端到端延迟承诺 |
+| {{allowed.lateness.ms}} | 600000 | 用于日终态时间判断 |
+| {{retention.days}} | 14 | 按已观察到的最新业务日推进 |
+| {{fleet.mode}} | {{legacy_snapshot}} | 当前关闭历史时不参与规则筛选；开启后缺当日快照会等待 |
+| {{rule.version}} | {{java-v6-full-command-analysis}} | 仓库配置值，实际运行值以部署配置为准 |
+
+关闭历史时不产生新主机、数量突增及历史模板差集；依赖历史目标地址的横向移动规则也不执行。开启历史时，前 N 个基线日均需封账；零事件日也需要封账。SAS 的 legacy fleet 还需要对应目标日快照。{{exact}} 模式基于桶内数据计算，结果可能与旧 ES 近似基数/截断口径不同。
+
+h3. 4.3 历史候选与评分
+
+对于 SAS 三元组 {{(host_ip, username, proc_name)}}，令目标日次数为 T、基线 N 日次数之和为 B：
+
+{code}
+ratio = T / (B + 1)，当 B > 0
+ratio = T，当 B = 0
+{code}
+
+* T 小于 {{min.count}} 不进入该候选流程；B > 0 且 ratio < 2 的非罕见网关被过滤。过滤使用未舍入比值。
+* 罕见网关候选全部进入 deep，其余按预评分补足名额；未进入 deep 的候选写入 {{shallow_candidates}}。
+* deep 基础评分结合新主机、新三元组、新模板、新父链、fleet 稀有度、突增倍率和次数；再叠加结构加分、部署/白名单调整。结构加分封顶 45，罕见网关优先提升在白名单调整后施加。
+* 日结果排序并受最终上限约束；完整特征不保证每条命中都进入 deep 或最终输出。
+* Nginx 使用 URI 模板与 upstream 的独立历史规则；关闭历史对比时不产生 Nginx 差异信号。
+
+h3. 4.4 日快照生命周期
+
+|| 状态 || 条件 ||
+| {{PROVISIONAL}} | 目标日尚未满足封账及日结束加允许迟到时间的终态条件 |
+| {{FINAL}} | 目标日已封账，处理时间达到日结束加允许迟到时间，且该日首次进入终态 |
+| {{CORRECTED}} | 已终态结果在保留期内再次变化 |
+
+若历史模式启用，基线未就绪或 legacy fleet 未就绪时不发布该目标日。已封账数据仍可能因保留期内补到事件产生修订，超出在线保留期的事件需要离线回放处理。
+
+h2. 5. 固定时间窗口设计
+
+h3. 5.1 窗口与时间
+
+窗口按事件时间相对于 Unix 纪元对齐：{{start = floor(eventTime / windowSize) * windowSize}}。仓库配置窗口 300000 ms、乱序容忍 5000 ms、空闲分区识别 60000 ms、允许迟到 600000 ms。历史对比打开时，窗口长度必须整除 24 小时，以便按过去各日相同时段比较。
+
+事件达到窗口结束且 watermark 推进时才关闭窗口；空闲识别不能保证完全没有新事件时 watermark 必然推进。迟到边界之外的事件进入固定窗口 late topic。
+
+h3. 5.2 双通道
+
+|| 通道 || 内容 || 是否等待历史 ||
+| {{high_risk}} | Linux high/critical 行为模式（排除依赖 post_filter 的规则），以及管道执行解释器、编码 PowerShell、可疑 LOLBin 结构；逐条计数，结构原因累计 | 不等待历史，但仍需窗口关闭并经过 {{window.min.score}} |
+| {{history}} | SAS 三元组次数和命令模板；Nginx URI 与新 upstream；对比过去 N 日相同时间段 | 所需历史日期全部 SEAL 且状态仍可用时才输出 |
+
+历史突增倍率为目标窗口次数除以 {{max(历史窗口平均次数, window.history.baseline.floor)}}；当前 floor 为 1.0，倍率阈值为 3.0。{{min.count=2}} 约束相关历史信号。此通道不计算日作业的 fleet、新主机、父链和历史行为模式。
+
+仓库配置 {{history.compare=true}}、{{window.min.score=0}}；若关闭历史模式，作业调用日规则引擎对单个窗口计算，语义与双通道模式不同。切换模式不能依赖旧 savepoint 假定历史已预热。
+
+h3. 5.3 固定窗口输出状态
+
+* {{FINAL}}：首次关闭并发布时的状态，不代表基线完整或迟到期结束。
+* {{CORRECTED}}：首次输出后，基线封账、迟到数据等导致快照变化。
+* {{LTS}}：watermark 达到窗口结束加允许迟到时间，且历史模式下基线已就绪；表示当前在线计算不再修正该窗口。首次输出时条件已满足可直接为 LTS。
+* 基线一直未就绪或 watermark 未推进时不能保证进入 LTS；没有输出过信号的窗口不建立空记录。已有信号变空时输出空 REPLACE 和撤回 ID。
+* 固定窗口历史聚合按 N+2 天及允许迟到相关定时器保留；超期数据需离线重算。
+
+h2. 6. 规则与特征
+
+h3. 6.1 行为模式
+
+Linux 规则位于 {{src/main/resources/rules/tracing_sas_linux.json}}，由 {{Behavior}} 对 {{bool}}、{{term}}、{{terms}}、{{wildcard}} 子集求值，部分规则还有 Java 上下文判断；不是通用 Elasticsearch 或 Sigma 查询引擎。
+
+|| 模式 || 当前说明 ||
+| {{cron_persistence}} | 编辑/安装 crontab 或向计划任务目录写入；普通列出/读取不直接命中 |
+| {{credential_harvest}} | 可识别的读取、复制或打包命令访问 SSH 私钥或 shadow |
+| {{reverse_shell}} / {{port_listen_bind}} | 命令结构线索，不能证明连接成功或执行成功 |
+| {{tunnel_proxy}} / {{dns_tunnel_tool}} | 特定工具或命令形态 |
+| {{data_exfil}} / {{security_disable}} | 可疑上传或关闭防护的命令形态 |
+| {{dns_high_freq_suspicious}} | 按单主机每日不少于 50 个 nslookup/dig/host 事件；不分析域名熵或子域名特征 |
+| {{ssh_lateral_novel_target}} | 比较相同源主机、用户的历史目标；依赖日历史，不进入固定窗口高危通道 |
+
+日行为规则按规则及主机累计有效命中，横向规则进一步按用户名和规范化目的地址分组。横向基线取最近 3 个基线日的匹配事件；缺源主机或用户不使用基线豁免。只对 IPv4 RFC1918、100.64.0.0/10 和 IPv6 ULA 作为内网目标；域名、缺失和无法分类地址不视作已确认的内网目标。实际企业网络可能采用不同地址规划。
+
+h3. 6.2 特征、样本和边界
+
+* 日三元组及固定窗口历史模板使用全量事件生成命令模板；日 deep 使用全量父链签名和紧凑评分事件。
+* 展示样本仍有数量上限，可能不包含所有触发事件；输出的模板及原因也受各自展示逻辑或上限约束。
+* Windows 和 Jumper 的 {{novel_external_connect}} 名称保留，但实现只判断公网单播候选连接，不比较该地址历史是否新出现。IP 分类是保守启发式，不保证实际可路由。
+* 行为规则、地址分类和白名单都不是完整攻击识别；命令变体、间接脚本、缺失字段、企业地址和正常运维均需结合环境核验。
+
+h2. 7. 状态、容错与交付语义
+
+h3. 7.1 状态内容
+
+|| 状态 || 内容 ||
+| 日作业 | 待处理事件、日桶、fleet 覆盖、就绪等待、最近快照签名与 ID、revision、最大业务日、定时器 |
+| 固定窗口 | 窗口桶、窗口元数据、快照 ID/revision、日封账标记、事件时间定时器 |
+| 日桶及窗口桶 | 去重身份、聚合计数、模板与父链签名、紧凑评分事件、有限样本；按需包含行为和固定窗口高危聚合 |
+
+状态由 Flink checkpoint 管理，算子 UID 与 maxParallelism 固定。紧凑评分事件仍包含命令、父链、路径等敏感字段；状态会随着事件和特征数量增长。{{max.events.per.family.day}} 限制身份数：日作业按族和日，固定窗口按族和窗口；超过时失败，但该参数不限制总字节数或单条事件大小。
+
+h3. 7.2 Sink 一致性
+
+* Kafka 结果、DLQ、late 分别使用事务 Sink 和各自事务前缀后缀，checkpoint 成功后对 {{read_committed}} 消费者可见。
+* PostgreSQL JDBC 是至少一次写入，依靠主键及 {{incoming revision > stored revision}} 条件 upsert 抑制重复/旧修订；与 Kafka 不属于同一事务，也不与 checkpoint 原子提交。
+* 日表主键为 {{(index_family, target_day)}}；固定窗口表主键为 {{(index_family, window_start)}}。隔离回放应使用隔离输出表/topic，不能简单与现有 revision 混写。
+* Flink checkpoint、Kafka 事务超时、持久化目录和凭据必须按环境配置；事务前缀在并发作业间唯一，恢复时保持稳定。
+
+h3. 7.3 变更与恢复
+
+当前 {{DayBucket}} 对旧行为/特征状态版本进行兼容性检查。旧状态缺少完整事件、模板或行为计数，无法准确转换；遇到不兼容的非空状态会失败。当前规则升级应使用新消费组、checkpoint 和隔离输出，从完整基线期重放并核验，再切换消费者。兼容的其他升级可按 UID 与状态兼容性评估 savepoint 恢复。
+
+h2. 8. 输出契约与下游处理
+
+h3. 8.1 输出格式
+
+两条作业均输出 {{kind=SNAPSHOT}}、{{operation=REPLACE}} 的完整窗口快照；字段包括 {{schema_version}}、{{index_family}}、{{rule_version}}、{{revision}}、{{status}}、{{computed_at}}、{{all_signals}}、{{deleted_signal_ids}}、{{shallow_candidates}} 和 {{stats}}。日快照以 {{target_day}} 标识；固定窗口额外包含 {{window_start}}、{{window_end}}、{{window_size_ms}}、{{baseline_mode}}、{{baseline_complete}}、{{baseline_dates}}，并在双通道信号中标记 {{channel}}。
+
+h3. 8.2 消费约定
+
+# Kafka 消费者使用 {{isolation.level=read_committed}}。
+# 日结果按 {{(family, target_day)}}、固定窗口结果按 {{(family, window_start)}} 对最高 revision 幂等覆盖。
+# {{all_signals}} 是当前窗口完整集合，不是本次新增告警列表；处理 {{deleted_signal_ids}} 时考虑下游状态。
+# {{signal_id}} 基于族、窗口以及信号类型、实体与行为标签等稳定身份生成，不含分数；{{rule_version}} 记录规则口径但不替代 revision。
+# 不要仅凭固定窗口 {{FINAL}} 判断历史完整或永不修正；{{LTS}} 也仅表示在线计算终态，人工 SQL 或离线重算不受此状态约束。
+
+h2. 9. 部署与配置
+
+h3. 9.1 仓库默认配置对照
+
+|| 配置项 || 日作业 conf/mining.properties || 固定窗口 conf/window-mining.properties ||
+| 输入 | 三个 SAS 测试 topic | 三个 SAS 测试 topic |
+| 历史对比 | false | true |
+| 基线天数 | 5 | 5 |
+| 窗口 | UTC+08:00 自然日 | 5 分钟事件时间滚动窗口 |
+| checkpoint 间隔 / 超时 | 30 秒 / 600 秒 | 5 秒 / 600 秒 |
+| 迟到 | 10 分钟 | 10 分钟 |
+| Kafka 输出 | {{sls-mining-signals}} | {{sls-mining-window-fixed}} |
+| JDBC | 配置为启用；表 {{mining_window}} | 配置为启用；表 {{mining_window_fixed}} |
+
+以上是仓库配置快照，不证明线上正在使用。代码层 JDBC 默认值为关闭，但这两份实际仓库配置均开启；请通过受保护的运行配置提供密码，不将密钥写入文档或 URL。
+
+h3. 9.2 构建和提交
+
+{code:language=bash}
+mvn clean verify
+{code}
+
+将胖 JAR 上传至 Dinky 资源中心，绑定匹配的 Flink 1.18.x / Java 8 集群。日作业与固定窗口作业分别参考 {{deploy/dinky-submit.sql}} 和 {{deploy/dinky-submit-window.sql}}；打包内的配置修改后需要重建 JAR。运行时需正确配置 checkpoint 存储、Kafka 认证、事务超时、消费者组和数据库连接。无建表权限时提前使用对应 {{deploy/postgres-mining-window*.sql}} 脚本。
+
+首次切换前，使用独立输出及消费组进行覆盖完整基线期的影子回放；数据库、Kafka 和 Flink 集群连通性以及实际任务配置需在部署环境验证。
+
+h2. 10. 测试与验收
+
+|| 验证层 || 方法 || 验证范围 ||
+| 单元及算子 | {{mvn clean verify}} | 规则正反例、状态序列化、窗口、迟到、checkpoint 等已有测试；不等于全量规则效果证明 |
+| 本地日规则 | {{ReplayJob}} + JSON Lines | 输入文件一次性评估日规则；不连接 Kafka，不模拟 watermark、SEAL 时序或实时故障恢复 |
+| 测试日志 | {{scripts/generate_security_test_events.py}} | 当前时间生成模拟命令日志；命令是字符串，不会执行 |
+| 流式端到端 | 测试 Kafka + 实际 Flink/Dinky + 隔离输出 | 验证输入分区、watermark、SEAL、checkpoint、事务可见、revision、撤回、DLQ/late、JDBC |
+| 规则效果 | 有标签正例/反例、真实运维数据及人工复核 | 按规则衡量检出、误报、告警量和缺失日志覆盖；未标注数据不能直接计算漏报率 |
+| 容量与恢复 | 接近真实吞吐、字段大小、基线和保留期的压测与故障演练 | 状态大小、CPU、checkpoint 时长、恢复时间、端到端延迟及限制触发 |
+
+仓库内可用命令：
+{code:language=bash}
+mvn clean verify
+python3 scripts/generate_demo.py > /tmp/mining-demo.jsonl
+java -cp target/sls-hunter-flink-mining-1.0.0-SNAPSHOT.jar \
+  com.sls.hunter.flink.ReplayJob conf/replay.properties \
+  /tmp/mining-demo.jsonl 2026-06-10
+{code}
+
+回放配置 {{conf/replay.properties}} 使用 exact fleet，且默认历史对比打开；不得直接将它的结果视为当前日作业 {{history.compare=false}} 的等价结果。
+
+h2. 11. 监控与排障
+
+|| 现象 || 优先检查 ||
+| 没有日结果 | 输入族与时间、{{target.start.date}}、作业是否运行、历史开关、基线 SEAL、legacy fleet 快照、checkpoint 和 Kafka read_committed |
+| 固定窗口高危结果迟迟不出现 | watermark、空闲分区、窗口结束、{{window.min.score}}、checkpoint 提交及输出 topic |
+| {{baseline_complete=false}} | 所需各基线日的同族 SEAL、基线导入范围和保留期 |
+| 不断出现修订或撤回 | 迟到输入、补发 SEAL/基线事件、快照完整替换语义及 revision 消费方式 |
+| DLQ/late 增加 | 时间格式和未来偏差、事件身份、族路由、乱序/迟到范围与上游完整性 |
+| checkpoint 缓慢或失败 | 事件量、完整评分字段及样本状态字节、RocksDB/存储、反压、checkpoint 与 Kafka 事务超时 |
+| JDBC 与 Kafka 短暂不一致 | 两者非原子事务、JDBC 重试及 checkpoint 提交时点 |
+
+算子提供 {{lateEvents}} 和 {{duplicateEvents}} 计数器；重启后计数会重置。日志不打印原始输入、信号内容或 Kafka 认证配置；快照日志仅表示已交给下游算子，不代表 Kafka 事务已提交。日志实现与配置由 Flink 进程提供。
+
+h2. 12. 已知限制和后续方向
+
+# 同族按单键处理，parallelism 主要并行不同族；按日统一遍历和固定窗口状态序列化可能成为瓶颈，不能承诺 1～3 秒或其他生产延迟。
+# 规则评分、历史过滤、deep 限额和最终信号上限可能使可疑事件不进入最终结果；固定窗口高危通道也受规则范围和最低分影响。
+# 完整特征保存与有界展示样本分离，增加状态量与敏感数据保留；事件数量上限不是容量规划替代品。
+# SEAL 完整性是上游协议承诺；系统无法从 watermark 推断所有来源已到齐。迟到超期需离线重算。
+# 日输出、固定窗口输出和 JDBC/Kafka 的终态与一致性语义不同，需按各自协议消费。
+# 可考虑后续按实体细键拆分状态、明确版本化基线与排名、补充规则覆盖评估或 Sigma 子集适配；这些均不是当前已实现能力。
+
+h2. 13. 源码与配置索引
+
+* 主入口：{{src/main/java/com/sls/hunter/flink/MiningJob.java}}、{{WindowMiningJob.java}}、{{ReplayJob.java}}
+* 流状态：{{MiningProcessFunction.java}}、{{WindowMiningFunction.java}}、{{DayBucket.java}}
+* 检测逻辑：{{MiningEngine.java}}、{{WindowMining.java}}、{{Scoring.java}}、{{Behavior.java}}、{{Whitelist.java}}、{{Templates.java}}、{{IpAddresses.java}}
+* 规则资源：{{src/main/resources/rules/tracing_sas_linux.json}}、{{tracing_sas_win.json}}、{{tracing_sas_jumper.json}}
+* 配置：{{conf/mining.properties}}、{{conf/window-mining.properties}}、{{conf/replay.properties}}
+* 提交与数据库：{{deploy/dinky-submit.sql}}、{{deploy/dinky-submit-window.sql}}、{{deploy/postgres-mining-window.sql}}、{{deploy/postgres-mining-window-fixed.sql}}
+* 项目说明与历史设计：{{README.md}}、{{docs/realtime-design.md}}、{{docs/checkpoint-tuning.md}}
