@@ -29,6 +29,8 @@ public class WindowMiningFunction extends KeyedProcessFunction<String, Event, St
   private final MiningConfig config;
   private transient MapState<Long, String> buckets;
   private transient MapState<Long, String> metas;
+  private transient MapState<String, Boolean> sealedDays;
+  private static final long DAY_MS = 86_400_000L;
 
   public WindowMiningFunction(MiningConfig config) {
     this.config = config;
@@ -36,10 +38,6 @@ public class WindowMiningFunction extends KeyedProcessFunction<String, Event, St
 
   @Override
   public void open(Configuration parameters) throws Exception {
-    if (config.historyCompare) {
-      throw new IllegalStateException(
-          "Fixed-window scoring uses the structural and behavior rules with history.compare=false");
-    }
     LOG.info(
         "Opening fixed-window operator: subtask={}, windowMillis={}, latenessMillis={}, minScore={}",
         getRuntimeContext().getIndexOfThisSubtask(),
@@ -56,11 +54,22 @@ public class WindowMiningFunction extends KeyedProcessFunction<String, Event, St
             .getMapState(
                 new MapStateDescriptor<Long, String>(
                     "fixed-window-meta-v1", Long.class, String.class));
+    sealedDays = getRuntimeContext().getMapState(new MapStateDescriptor<String, Boolean>("fixed-window-sealed-days-v1", String.class, Boolean.class));
   }
 
   @Override
   public void processElement(Event event, Context ctx, Collector<String> out) throws Exception {
     if (!event.kind.equals("EVENT")) {
+      if (config.historyCompare && event.kind.equals("SEAL")) {
+        long expiry = LocalDate.parse(event.day).plusDays(config.baselineDays + 3L).atStartOfDay(Event.ZONE).toInstant().toEpochMilli();
+        if (expiry <= ctx.timerService().currentWatermark()) {
+          ctx.output(LATE, Json.write(Json.obj("reason", "expired_seal", "event", event)));
+          return;
+        }
+        sealedDays.put(event.day, true);
+        ctx.timerService().registerEventTimeTimer(expiry);
+        recomputeClosed(ctx, out);
+      }
       LOG.info(
           "Control input ignored by fixed window: family={}, kind={}, day={}",
           ctx.getCurrentKey(),
@@ -82,7 +91,7 @@ public class WindowMiningFunction extends KeyedProcessFunction<String, Event, St
       return;
     }
     DayBucket bucket = readBucket(start);
-    if (!bucket.add(event)) {
+    if (!bucket.add(event, false)) {
       LOG.info(
           "Input skipped: family={}, windowStart={}, id={}, reason=duplicateOrDayEndSubsecond",
           ctx.getCurrentKey(),
@@ -90,14 +99,19 @@ public class WindowMiningFunction extends KeyedProcessFunction<String, Event, St
           event.id);
       return;
     }
+    if (config.historyCompare) WindowMining.recordHighRisk(bucket, event);
+    if (config.historyCompare && bucket.identities.size() > config.integer("max.events.per.family.day", 2000000))
+      throw new IllegalStateException("Fixed-window identity capacity exceeded");
     buckets.put(start, Json.write(bucket));
     Meta meta = meta(start);
     if (meta.closed || watermark >= end) {
-      publish(ctx.getCurrentKey(), out, start, bucket, meta, ctx.timerService().currentProcessingTime());
+      publish(ctx.getCurrentKey(), out, start, bucket, meta, ctx.timerService().currentProcessingTime(), ctx.timerService().currentWatermark());
       meta.closed = true;
       remember(ctx, start, end, meta, watermark);
+      if (config.historyCompare) recomputeDependents(ctx, out, start);
       return;
     }
+    if (config.historyCompare) recomputeDependents(ctx, out, start);
     if (!meta.timerArmed) {
       ctx.timerService().registerEventTimeTimer(end);
       meta.timerArmed = true;
@@ -112,19 +126,16 @@ public class WindowMiningFunction extends KeyedProcessFunction<String, Event, St
 
   @Override
   public void onTimer(long timestamp, OnTimerContext ctx, Collector<String> out) throws Exception {
-    List<Long> starts = new ArrayList<>();
-    for (Long start : buckets.keys()) {
-      starts.add(start);
-    }
-    for (Long start : starts) {
-      long end = start + config.windowSizeMillis;
-      if (timestamp >= end) {
-        close(ctx, out, start, end);
-      }
-      if (timestamp >= end + config.latenessMillis) {
-        buckets.remove(start);
-        metas.remove(start);
-      }
+    long closingStart = timestamp - config.windowSizeMillis;
+    if (buckets.contains(closingStart)) close(ctx, out, closingStart, timestamp);
+    long retention = config.historyCompare ? (config.baselineDays + 2L) * DAY_MS : 0;
+    long expiringStart = timestamp - config.windowSizeMillis - retention - config.latenessMillis;
+    buckets.remove(expiringStart);
+    metas.remove(expiringStart);
+    if (config.historyCompare) {
+      LocalDate expiryDay = Instant.ofEpochMilli(timestamp).atZone(Event.ZONE).toLocalDate();
+      if (expiryDay.atStartOfDay(Event.ZONE).toInstant().toEpochMilli() == timestamp)
+        sealedDays.remove(expiryDay.minusDays(config.baselineDays + 3L).toString());
     }
   }
 
@@ -138,7 +149,7 @@ public class WindowMiningFunction extends KeyedProcessFunction<String, Event, St
       return;
     }
     DayBucket bucket = Json.MAPPER.readValue(stored, DayBucket.class);
-    publish(ctx.getCurrentKey(), out, start, bucket, meta, ctx.timerService().currentProcessingTime());
+    publish(ctx.getCurrentKey(), out, start, bucket, meta, ctx.timerService().currentProcessingTime(), ctx.timerService().currentWatermark());
     meta.closed = true;
     remember(ctx, start, end, meta, ctx.timerService().currentWatermark());
   }
@@ -146,6 +157,13 @@ public class WindowMiningFunction extends KeyedProcessFunction<String, Event, St
   /** 窗口关闭后还在迟到范围内就留着状态，并登记清理定时器。已经超过迟到则马上丢掉。 */
   private void remember(Context ctx, long start, long end, Meta meta, long watermark)
       throws Exception {
+    if (config.historyCompare) {
+      long expiry = end + (config.baselineDays + 2L) * DAY_MS + config.latenessMillis;
+      if (watermark >= expiry) { buckets.remove(start); metas.remove(start); return; }
+      if (!meta.purgeArmed) { ctx.timerService().registerEventTimeTimer(expiry); meta.purgeArmed = true; }
+      metas.put(start, Json.write(meta.toMap()));
+      return;
+    }
     if (config.latenessMillis == 0 || watermark >= end + config.latenessMillis) {
       buckets.remove(start);
       metas.remove(start);
@@ -158,11 +176,53 @@ public class WindowMiningFunction extends KeyedProcessFunction<String, Event, St
     metas.put(start, Json.write(meta.toMap()));
   }
 
+  /** Re-evaluate retained closed windows when a seal or a still-admissible baseline changes. */
+  private void recomputeClosed(Context ctx, Collector<String> out) throws Exception {
+    List<Long> starts = new ArrayList<>();
+    for (Long start : buckets.keys()) starts.add(start);
+    for (Long start : starts) {
+      Meta meta = meta(start);
+      if (meta.closed && ctx.timerService().currentWatermark() < start + config.windowSizeMillis + 2L * DAY_MS + config.latenessMillis) {
+        publish(ctx.getCurrentKey(), out, start, readBucket(start), meta, ctx.timerService().currentProcessingTime(), ctx.timerService().currentWatermark());
+        metas.put(start, Json.write(meta.toMap()));
+      }
+    }
+  }
+
+  private void recomputeDependents(Context ctx, Collector<String> out, long baselineStart) throws Exception {
+    for (int age = 1; age <= config.baselineDays; age++) {
+      long start = baselineStart + age * DAY_MS;
+      String stored = buckets.get(start);
+      if (stored == null) continue;
+      Meta meta = meta(start);
+      if (meta.closed && ctx.timerService().currentWatermark() < start + config.windowSizeMillis + 2L * DAY_MS + config.latenessMillis) {
+        publish(ctx.getCurrentKey(), out, start, Json.MAPPER.readValue(stored, DayBucket.class), meta,
+            ctx.timerService().currentProcessingTime(), ctx.timerService().currentWatermark());
+        metas.put(start, Json.write(meta.toMap()));
+      }
+    }
+  }
+
   private void publish(
-      String family, Collector<String> out, long start, DayBucket bucket, Meta meta, long computedAt)
+      String family, Collector<String> out, long start, DayBucket bucket, Meta meta, long computedAt, long watermark)
       throws Exception {
     LocalDate day = Instant.ofEpochMilli(start).atZone(Event.ZONE).toLocalDate();
-    MiningEngine.Result result = WindowMining.evaluate(family, bucket, day, config);
+    List<DayBucket> baseline = new ArrayList<>();
+    List<String> baselineDates = new ArrayList<>();
+    boolean ready = config.historyCompare;
+    if (config.historyCompare) {
+      for (int age = 1; age <= config.baselineDays; age++) {
+        long baselineStart = start - age * DAY_MS;
+        String date = Instant.ofEpochMilli(baselineStart).atZone(Event.ZONE).toLocalDate().toString();
+        baselineDates.add(date);
+        if (!Boolean.TRUE.equals(sealedDays.get(date))
+            || watermark >= baselineStart + config.windowSizeMillis + (config.baselineDays + 2L) * DAY_MS + config.latenessMillis) ready = false;
+        baseline.add(readBucket(baselineStart));
+      }
+    }
+    MiningEngine.Result result = config.historyCompare
+        ? WindowMining.evaluateChannels(family, bucket, baseline, ready, config)
+        : WindowMining.evaluate(family, bucket, day, config);
     List<Map<String, Object>> scored =
         WindowMining.highScores(result.signals(), config.windowMinScore);
     String signature =
@@ -174,7 +234,7 @@ public class WindowMiningFunction extends KeyedProcessFunction<String, Event, St
                 result.shallow(),
                 "stats",
                 result.stats()));
-    if (scored.isEmpty() || signature.equals(meta.signature)) {
+    if ((scored.isEmpty() && meta.revision == 0) || signature.equals(meta.signature)) {
       LOG.info(
           "Fixed window snapshot suppressed: family={}, windowStart={}, signals={}",
           family,
@@ -231,7 +291,11 @@ public class WindowMiningFunction extends KeyedProcessFunction<String, Event, St
                 "window_size_ms",
                 config.windowSizeMillis,
                 "baseline_dates",
-                new ArrayList<String>(),
+                baselineDates,
+                "baseline_mode",
+                config.historyCompare ? "same_time_previous_days" : "none",
+                "baseline_complete",
+                ready,
                 "rule_version",
                 config.get("rule.version", "java-v1-exact-fleet"),
                 "revision",

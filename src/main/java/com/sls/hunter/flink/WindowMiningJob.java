@@ -19,15 +19,14 @@ import org.slf4j.LoggerFactory;
 /**
  * 固定时间窗口作业。和 {@link MiningJob} 并行，使用自己的消费组和事务前缀，不改按日那张 {@code mining_window}。
  *
- * <p>窗口按事件时间滚动。打分复用当前 {@code history.compare=false} 的命令结构规则和 Linux 行为规则。达到分数线的结果写入
- * Kafka，并在打开 JDBC 时 upsert 到 {@code mining_window_fixed}。
+ * <p>窗口按事件时间滚动。历史模式分别计算高危行为和已封账的历史同时段异常；关闭历史模式时保留原规则。
  */
 public final class WindowMiningJob {
   private static final Logger LOG = LoggerFactory.getLogger(WindowMiningJob.class);
 
   public static void main(String[] args) throws Exception {
     MiningConfig config = MiningConfig.load(args);
-    requireRulesOnly(config);
+    validateWindowConfig(config);
     LOG.info(
         "Configuring fixed-window mining job: windowMillis={}, outOfOrdernessMillis={}, idleMillis={}, latenessMillis={}, minScore={}, historyCompare={}",
         config.windowSizeMillis,
@@ -135,11 +134,15 @@ public final class WindowMiningJob {
     LOG.info("Fixed-window mining job execution completed");
   }
 
-  /** 固定窗口没有前 N 天的基线。打开历史对比会把窗口里的命令全部当成新增。 */
-  static void requireRulesOnly(MiningConfig config) {
+  /** Historical comparison requires identical epoch-aligned slots on consecutive days. */
+  static void validateWindowConfig(MiningConfig config) {
     if (config.historyCompare) {
-      throw new IllegalArgumentException(
-          "Fixed-window scoring uses the structural and behavior rules with history.compare=false");
+      if (86_400_000L % config.windowSizeMillis != 0)
+        throw new IllegalArgumentException("history comparison requires window.size.ms to divide a day");
+      double ratio = Double.parseDouble(config.get("window.history.spike.ratio", "3.0"));
+      double floor = Double.parseDouble(config.get("window.history.baseline.floor", "1.0"));
+      if (!Double.isFinite(ratio) || ratio <= 0 || !Double.isFinite(floor) || floor <= 0)
+        throw new IllegalArgumentException("window history ratio and floor must be finite and positive");
     }
   }
 }

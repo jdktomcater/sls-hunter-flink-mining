@@ -65,9 +65,14 @@ java -cp target/sls-hunter-flink-mining-1.0.0-SNAPSHOT.jar \
 
 ## 固定时间窗口
 
-`WindowMiningJob` 与按日作业并行，单独的消费组读同一份输入。窗口是按事件时间对齐到 Unix 纪元的滚动窗口，默认 5 分钟（`window.size.ms`）。窗口内命令走 `MiningEngine` 在 `history.compare=false` 时的命令结构规则和 Linux 行为规则，不把空基线当成新增。`history.compare=true` 时作业直接拒绝启动。
+`WindowMiningJob` 与按日作业并行，使用独立消费组。窗口按事件时间对齐到 Unix 纪元，默认 5 分钟；开启历史对比时窗口长度必须整除 24 小时。当前配置 `history.compare=true`，使用两个独立通道：
 
-窗口关闭后，分数达到 `window.min.score`（含本数，默认 0，即现有规则留下的信号都保留）的结果按分数从高到低打成一条 `REPLACE` 快照。Kafka 写到本作业自己的 `kafka.output.topic`，key 是 `index_family:window_start`。`jdbc.enabled=true` 时再 upsert 到 `mining_window_fixed`（`jdbc.window.table`），主键是 `index_family, window_start`，只接受更大的 `revision`。首次关闭是 `FINAL`，允许迟到内的补录重算为 `CORRECTED`。超过 `allowed.lateness.ms` 的事件进入本作业的 late topic。没有过线信号的窗口不落库。
+- `high_risk`：Linux 的 high/critical 行为模式（不包含依赖历史目的地址的规则）以及命中管道执行解释器、编码 PowerShell、可疑 LOLBin 结构的事件，逐条匹配并按窗口计数；不等待历史基线。信号仍受 `window.min.score` 过滤。规则是启发式线索，不等同于确认攻击。
+- `history`：按 `baseline.days` 取过去 N 天相同时间段，比较 SAS 三元组次数和采样命令模板，以及 Nginx URI / 新 upstream。三元组和 URI 的突增倍率为目标窗口次数除以 `max(历史窗口平均次数, window.history.baseline.floor)`，阈值为 `window.history.spike.ratio`；目标次数需达到 `min.count`。模板对比仍受每个三元组最早 12 条样本限制。该通道不计算日作业的 fleet、新主机、父链和历史行为模式，不能视作完整复刻日规则。
+
+历史窗口所属的每天都必须收到同族 `SEAL`，零事件的已封账窗口才视为 0。缺失封账时仅输出高危通道，`baseline_complete=false`；封账到达后重新计算保留的已关闭窗口。上游必须保证同族数据和封账的顺序与完整性，历史导入要覆盖基线期；越过 watermark 允许迟到范围的事件进入 late topic，需离线回放。基线同一时段的聚合保留 N+2 天并使用 Flink 状态和 checkpoint；迟到封账最多影响关闭后保留期内的窗口，超期需要离线重算。全量命中计数与有界样本分开，实际容量、延迟和 checkpoint 需在部署环境压测。
+
+快照包含 `baseline_mode`、`baseline_complete` 和 `baseline_dates`，信号包含 `channel`。窗口第一次输出为 `FINAL`，后续变化为 `CORRECTED`；`FINAL` 是窗口首次关闭语义，不表示历史基线已就绪或迟到期结束。已输出窗口变为空时发送空 `REPLACE` 和撤回 ID。Kafka 使用事务 sink；PostgreSQL 按窗口 revision upsert，但与 Kafka 不在同一事务。`history.compare=false` 保持原来的规则模式。切换历史模式应从头回放完整基线，旧模式的 savepoint 不含历史封账和高危计数，不可当作已预热基线。
 
 入口是 [deploy/dinky-submit-window.sql](deploy/dinky-submit-window.sql)，配置是打包进 JAR 的 `window-mining.properties`。账号不能建表时先跑 [deploy/postgres-mining-window-fixed.sql](deploy/postgres-mining-window-fixed.sql)。`kafka.group.id` 和 `kafka.transaction.prefix` 不能与按日作业相同。
 

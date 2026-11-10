@@ -218,13 +218,162 @@ class WindowMiningTest {
     }
   }
 
-  @Test
-  void historyComparisonIsRejected() {
+  private static MiningConfig historyConfig() {
     Properties properties = new Properties();
-    properties.setProperty("target.start.date", "2026-06-10");
     properties.setProperty("history.compare", "true");
-    assertThrows(
-        IllegalArgumentException.class,
-        () -> WindowMiningJob.requireRulesOnly(new MiningConfig(properties)));
+    properties.setProperty("baseline.days", "1");
+    properties.setProperty("fleet.mode", "exact");
+    properties.setProperty("window.size.ms", "60000");
+    properties.setProperty("allowed.lateness.ms", "10000");
+    return new MiningConfig(properties);
   }
+
+  private static Event seal(String day) {
+    return Event.parse(Json.write(Json.obj("kind", "SEAL", "index_family", "tracing_sas_linux", "day", day)));
+  }
+
+  @Test
+  void historyRejectsWindowsThatDoNotAlignWithDays() {
+    Properties properties = new Properties();
+    properties.setProperty("history.compare", "true");
+    properties.setProperty("window.size.ms", "70000");
+    assertThrows(IllegalArgumentException.class, () -> WindowMiningJob.validateWindowConfig(new MiningConfig(properties)));
+  }
+
+  @Test
+  void highRiskDoesNotWaitForBaselineAndChecksEventsBeyondSampleLimit() throws Exception {
+    long start = Instant.parse("2026-06-10T02:00:00Z").toEpochMilli();
+    try (KeyedOneInputStreamOperatorTestHarness<String, Event, String> h = harness(historyConfig())) {
+      h.open();
+      for (int i = 0; i < 31; i++) send(h, at("shell-" + i, start + i, "10.0.0.1", "bash", SHELL));
+      send(h, at("other-host", start + 50, "10.0.0.99", "bash", SHELL));
+      h.processWatermark(new Watermark(start + 60000));
+      Map<String, Object> snapshot = Json.map(h.extractOutputValues().get(0));
+      assertEquals(false, snapshot.get("baseline_complete"));
+      assertTrue(signals(snapshot).stream().anyMatch(row -> "high_risk".equals(row.get("channel"))
+          && "10.0.0.99".equals(row.get("host_ip"))));
+      assertTrue(signals(snapshot).stream().noneMatch(row -> "history".equals(row.get("channel"))));
+    }
+  }
+
+  @Test
+  void sealedSameTimeBaselineProducesHistoryAndUsesAverage() throws Exception {
+    long target = Instant.parse("2026-06-10T02:00:00Z").toEpochMilli();
+    long prior = target - 86400000L;
+    try (KeyedOneInputStreamOperatorTestHarness<String, Event, String> h = harness(historyConfig())) {
+      h.open();
+      send(h, at("old", prior, "10.0.0.1", "echo", "echo hi"));
+      send(h, seal("2026-06-09"));
+      for (int i = 0; i < 3; i++) send(h, at("new" + i, target + i, "10.0.0.1", "echo", "echo hi"));
+      h.processWatermark(new Watermark(target + 60000));
+      Map<String, Object> snapshot = h.extractOutputValues().stream().map(Json::map)
+          .filter(row -> "2026-06-10T02:00:00Z".equals(row.get("window_start"))).findFirst().get();
+      assertEquals(true, snapshot.get("baseline_complete"));
+      Map<String, Object> signal = signals(snapshot).stream().filter(row -> "window_spike_triple".equals(row.get("signal_type"))).findFirst().get();
+      assertEquals(3.0, ((Number) signal.get("spike_ratio")).doubleValue());
+      assertEquals(1L, ((Number) signal.get("baseline_count")).longValue());
+    }
+  }
+
+  @Test
+  void lateSealActivatesZeroBaselineAndSurvivesCheckpoint() throws Exception {
+    long target = Instant.parse("2026-06-10T02:00:00Z").toEpochMilli();
+    OperatorSubtaskState checkpoint;
+    try (KeyedOneInputStreamOperatorTestHarness<String, Event, String> h = harness(historyConfig())) {
+      h.open();
+      send(h, at("one", target, "10.0.0.1", "echo", "echo hi"));
+      send(h, at("two", target + 1, "10.0.0.1", "echo", "echo hi"));
+      h.processWatermark(new Watermark(target + 60000));
+      assertTrue(h.extractOutputValues().isEmpty());
+      checkpoint = h.snapshot(1, target);
+    }
+    try (KeyedOneInputStreamOperatorTestHarness<String, Event, String> h = harness(historyConfig())) {
+      h.initializeState(checkpoint); h.open();
+      h.processWatermark(new Watermark(target + 60000));
+      send(h, seal("2026-06-09"));
+      Map<String, Object> snapshot = Json.map(h.extractOutputValues().get(0));
+      assertEquals(true, snapshot.get("baseline_complete"));
+      assertTrue(signals(snapshot).stream().anyMatch(row -> "window_novel_triple".equals(row.get("signal_type"))));
+    }
+  }
+  @Test
+  void sealUpdatesAlreadyPublishedHighRiskSnapshot() throws Exception {
+    long target = Instant.parse("2026-06-10T02:00:00Z").toEpochMilli();
+    try (KeyedOneInputStreamOperatorTestHarness<String, Event, String> h = harness(historyConfig())) {
+      h.open();
+      send(h, at("shell", target, "10.0.0.1", "bash", SHELL));
+      h.processWatermark(new Watermark(target + 60000));
+      Map<String, Object> first = Json.map(h.extractOutputValues().get(0));
+      assertEquals(false, first.get("baseline_complete"));
+      send(h, seal("2026-06-09"));
+      Map<String, Object> updated = Json.map(h.extractOutputValues().get(1));
+      assertEquals(true, updated.get("baseline_complete"));
+      assertEquals("CORRECTED", updated.get("status"));
+      assertEquals(2L, ((Number) updated.get("revision")).longValue());
+      assertTrue(signals(updated).stream().anyMatch(row -> "reverse_shell".equals(row.get("behavior_label"))));
+    }
+  }
+
+  @Test
+  void fixedWindowIncludesLastSubsecondOfDay() throws Exception {
+    long eventTime = Instant.parse("2026-06-10T15:59:59.999Z").toEpochMilli();
+    try (KeyedOneInputStreamOperatorTestHarness<String, Event, String> h = harness(historyConfig())) {
+      h.open(); send(h, at("last", eventTime, "10.0.0.1", "bash", SHELL));
+      h.processWatermark(new Watermark(eventTime + 1));
+      assertTrue(signals(Json.map(h.extractOutputValues().get(0))).stream()
+          .anyMatch(row -> "reverse_shell".equals(row.get("behavior_label"))));
+    }
+  }
+
+  @Test
+  void lateEvidenceCanRetractLastHistoricalSignal() throws Exception {
+    long target = Instant.parse("2026-06-10T02:00:00Z").toEpochMilli();
+    try (KeyedOneInputStreamOperatorTestHarness<String, Event, String> h = harness(historyConfig())) {
+      h.open();
+      for (int i = 0; i < 20; i++) send(h, at("old" + i, target - 86400000L + i, "10.0.0.1", "echo", "echo usual"));
+      send(h, seal("2026-06-09"));
+      send(h, at("new1", target + 30000, "10.0.0.1", "echo", "echo different"));
+      send(h, at("new2", target + 31000, "10.0.0.1", "echo", "echo different"));
+      h.processWatermark(new Watermark(target + 60000));
+      Map<String, Object> first = Json.map(h.extractOutputValues().get(0));
+      assertTrue(signals(first).stream().anyMatch(row -> "window_novel_template".equals(row.get("signal_type"))));
+      for (int i = 0; i < 12; i++) send(h, at("late" + i, target + i, "10.0.0.1", "echo", "echo usual"));
+      List<String> output = h.extractOutputValues();
+      Map<String, Object> last = Json.map(output.get(output.size() - 1));
+      assertTrue(signals(last).isEmpty());
+      assertEquals("CORRECTED", last.get("status"));
+      assertTrue(((List<?>) last.get("deleted_signal_ids")).size() > 0);
+    }
+  }
+
+  @Test
+  void encodedPowershellIsDetectedWithoutHistoryOrMinimumCount() throws Exception {
+    long start = Instant.parse("2026-06-10T02:00:00Z").toEpochMilli();
+    Event e = Event.parse(Json.write(Json.obj("event_id", "ps", "index_family", "tracing_sas_win", "payload",
+        Json.obj("@timestamp", Instant.ofEpochMilli(start).toString(), "host_ip", "10.0.0.1", "username", "u",
+            "proc_name", "powershell.exe", "cmdline", "powershell -enc AAAAAAAAAAAAAAAAAAAAAAAA"))));
+    try (KeyedOneInputStreamOperatorTestHarness<String, Event, String> h = harness(historyConfig())) {
+      h.open(); send(h, e); h.processWatermark(new Watermark(start + 60000));
+      Map<String, Object> snapshot = Json.map(h.extractOutputValues().get(0));
+      assertEquals(false, snapshot.get("baseline_complete"));
+      assertTrue(signals(snapshot).stream().anyMatch(row -> "high_risk_structure".equals(row.get("signal_type"))));
+    }
+  }
+
+  @Test
+  void historyUsesMeanAcrossMatchingSlots() {
+    MiningConfig config = historyConfig();
+    long start = Instant.parse("2026-06-10T02:00:00Z").toEpochMilli();
+    DayBucket target = new DayBucket(), first = new DayBucket(), second = new DayBucket();
+    for (int i = 0; i < 6; i++) target.add(at("t" + i, start + i, "h", "echo", "echo same"), false);
+    first.add(at("a", start - 86400000L, "h", "echo", "echo same"), false);
+    for (int i = 0; i < 3; i++) second.add(at("b" + i, start - 2 * 86400000L + i, "h", "echo", "echo same"), false);
+    MiningEngine.Result result = WindowMining.evaluateChannels("tracing_sas_linux", target,
+        java.util.Arrays.asList(first, second), true, config);
+    Map<String, Object> signal = result.signals().stream()
+        .filter(row -> "window_spike_triple".equals(row.get("signal_type"))).findFirst().get();
+    assertEquals(2.0, ((Number) signal.get("baseline_average")).doubleValue());
+    assertEquals(3.0, ((Number) signal.get("spike_ratio")).doubleValue());
+  }
+
 }

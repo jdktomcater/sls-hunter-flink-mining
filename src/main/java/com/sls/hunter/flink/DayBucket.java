@@ -36,6 +36,9 @@ public class DayBucket {
   public Map<String, Aggregate> uris = new TreeMap<>();
   public Map<String, Aggregate> upstreams = new TreeMap<>();
   public Map<String, Aggregate> patterns = new TreeMap<>();
+  /** Fixed-window high-risk matches, keyed by rule and host, counted before sampling. */
+  public Map<String, Aggregate> windowHighRisk = new TreeMap<>();
+  public Map<String, Aggregate> windowStructural = new TreeMap<>();
   public Map<String, List<Event>> firstHost = new TreeMap<>();
   public Map<String, List<Event>> fetchLatest = new TreeMap<>();
   public List<Event> lateralLatest = new ArrayList<>();
@@ -68,8 +71,12 @@ public class DayBucket {
 
   /** @return 事件进入了这一天。重复身份和日末亚秒事件返回 false。 */
   public boolean add(Event event) {
+    return add(event, true);
+  }
+
+  public boolean add(Event event, boolean legacyDayBoundary) {
     LocalTime local = Instant.ofEpochMilli(event.time).atZone(Event.ZONE).toLocalTime();
-    if (local.toSecondOfDay() == LAST_SECOND_OF_DAY && local.getNano() > 0) {
+    if (legacyDayBoundary && local.toSecondOfDay() == LAST_SECOND_OF_DAY && local.getNano() > 0) {
       return false;
     }
     if (!identities.add(event.id)) {
