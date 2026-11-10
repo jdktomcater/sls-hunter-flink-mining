@@ -20,6 +20,7 @@ import org.apache.flink.api.common.state.MapStateDescriptor;
 import org.apache.flink.api.common.state.ValueState;
 import org.apache.flink.api.common.state.ValueStateDescriptor;
 import org.apache.flink.configuration.Configuration;
+import org.apache.flink.metrics.Counter;
 import org.apache.flink.streaming.api.TimerService;
 import org.apache.flink.streaming.api.functions.KeyedProcessFunction;
 import org.apache.flink.util.Collector;
@@ -42,8 +43,11 @@ public class MiningProcessFunction extends KeyedProcessFunction<String, Event, S
   private transient MapState<String, String> fleetOverrides;
   private transient MapState<String, String> pendingEvents;
   private transient MapState<String, Long> revisions;
+  private transient MapState<String, String> readinessWaits;
   private transient ValueState<String> highDay;
   private transient ValueState<Long> pendingTimer;
+  private transient Counter lateEvents;
+  private transient Counter duplicateEvents;
 
   public MiningProcessFunction(MiningConfig config) {
     this.config = config;
@@ -60,6 +64,9 @@ public class MiningProcessFunction extends KeyedProcessFunction<String, Event, S
         config.emitMillis);
     pendingEvents = mapState("pending-events-v1", String.class);
     fleetOverrides = mapState("legacy-fleet-v1", String.class);
+    readinessWaits = mapState("readiness-waits-v1", String.class);
+    lateEvents = getRuntimeContext().getMetricGroup().counter("lateEvents");
+    duplicateEvents = getRuntimeContext().getMetricGroup().counter("duplicateEvents");
     buckets = mapState("daily-buckets-v1", String.class);
     outputs = mapState("last-snapshot-v1", String.class);
     revisions =
@@ -101,7 +108,8 @@ public class MiningProcessFunction extends KeyedProcessFunction<String, Event, S
     String highest = highDay.value();
     LocalDate top = highest == null ? day : LocalDate.parse(highest);
     if (day.isBefore(retentionStart(top))) {
-      LOG.info(
+      lateEvents.inc();
+      LOG.debug(
           "Input routed to late output: family={}, kind={}, day={}, id={}, retentionStart={}, highestDay={}, stage=ingress",
           ctx.getCurrentKey(),
           event.kind,
@@ -147,6 +155,7 @@ public class MiningProcessFunction extends KeyedProcessFunction<String, Event, S
       outputs.remove(storedDay);
       revisions.remove(storedDay);
       fleetOverrides.remove(storedDay);
+      readinessWaits.remove(storedDay);
     }
     if (!expired.isEmpty()) {
       LOG.info("Expired day state removed: family={}, days={}", ctx.getCurrentKey(), expired);
@@ -173,7 +182,7 @@ public class MiningProcessFunction extends KeyedProcessFunction<String, Event, S
       }
       timers.registerProcessingTimeTimer(time);
       pendingTimer.update(time);
-      LOG.info(
+      LOG.debug(
           "Processing timer registered: family={}, purpose={}, fireAt={}, replacedFireAt={}",
           family,
           purpose,
@@ -185,7 +194,7 @@ public class MiningProcessFunction extends KeyedProcessFunction<String, Event, S
   @Override
   public void onTimer(long timestamp, OnTimerContext ctx, Collector<String> out) throws Exception {
     long started = System.nanoTime();
-    LOG.info("Mining flush started: family={}, processingTime={}", ctx.getCurrentKey(), timestamp);
+    LOG.debug("Mining flush started: family={}, processingTime={}", ctx.getCurrentKey(), timestamp);
     pendingTimer.clear();
     List<String> drainedKeys = new ArrayList<>();
     Map<String, DayBucket> touched = drainPending(ctx, drainedKeys);
@@ -202,7 +211,7 @@ public class MiningProcessFunction extends KeyedProcessFunction<String, Event, S
           ctx.getCurrentKey(),
           ctx.timerService().currentProcessingTime() + 1,
           "continue-flush");
-      LOG.info(
+      LOG.debug(
           "Mining flush yielded: family={}, drained={}, elapsedMillis={}",
           ctx.getCurrentKey(),
           drainedKeys.size(),
@@ -220,7 +229,7 @@ public class MiningProcessFunction extends KeyedProcessFunction<String, Event, S
     if (nextFinal != Long.MAX_VALUE && nextFinal > timestamp) {
       scheduleAt(ctx.timerService(), ctx.getCurrentKey(), nextFinal, "final");
     }
-    LOG.info(
+    LOG.debug(
         "Mining flush completed: family={}, touchedDays={}, retainedDays={}, elapsedMillis={}",
         ctx.getCurrentKey(),
         touched.size(),
@@ -247,7 +256,8 @@ public class MiningProcessFunction extends KeyedProcessFunction<String, Event, S
       Event event = Json.MAPPER.readValue(pending.getValue(), Event.class);
       if (LocalDate.parse(event.day).isBefore(cutoff)) {
         late++;
-        LOG.info(
+        lateEvents.inc();
+        LOG.debug(
             "Input routed to late output: family={}, kind={}, day={}, id={}, retentionStart={}, stage=flush",
             ctx.getCurrentKey(),
             event.kind,
@@ -267,7 +277,7 @@ public class MiningProcessFunction extends KeyedProcessFunction<String, Event, S
       // 同一批里的 SEAL 只把这一天标成封账，不丢弃同批的事件。
       if (event.kind.equals("SEAL")) {
         if (bucket.sealed) {
-          LOG.info(
+          LOG.debug(
               "Seal ignored because day already sealed: family={}, day={}",
               ctx.getCurrentKey(),
               event.day);
@@ -282,6 +292,7 @@ public class MiningProcessFunction extends KeyedProcessFunction<String, Event, S
         seals++;
       } else if (bucket.identities.contains(event.id)) {
         skipped++;
+        duplicateEvents.inc();
         LOG.debug(
             "Input skipped: family={}, day={}, id={}, reason=duplicateIdentity",
             ctx.getCurrentKey(),
@@ -314,7 +325,7 @@ public class MiningProcessFunction extends KeyedProcessFunction<String, Event, S
         throw new IllegalStateException("Daily identity capacity exceeded");
       }
     }
-    LOG.info(
+    LOG.debug(
         "Pending batch drained: family={}, processed={}, accepted={}, skipped={}, late={}, seals={}",
         ctx.getCurrentKey(),
         processed,
@@ -342,7 +353,7 @@ public class MiningProcessFunction extends KeyedProcessFunction<String, Event, S
     for (Map.Entry<String, DayBucket> entry : days.entrySet()) {
       LocalDate target = LocalDate.parse(entry.getKey());
       if (target.isBefore(config.firstTarget)) {
-        LOG.info(
+        LOG.debug(
             "Window skipped before first target: family={}, targetDay={}, firstTarget={}",
             family,
             target,
@@ -352,12 +363,7 @@ public class MiningProcessFunction extends KeyedProcessFunction<String, Event, S
       if (config.historyCompare) {
         String missingDay = unsealedBaselineDay(target, days);
         if (missingDay != null) {
-          LOG.info(
-              "Window waiting for sealed baseline: family={}, targetDay={}, missingDay={}, baselineDays={}",
-              family,
-              target,
-              missingDay,
-              config.baselineDays);
+          logWait(family, entry.getKey(), "baseline:" + missingDay);
           continue;
         }
       }
@@ -368,17 +374,18 @@ public class MiningProcessFunction extends KeyedProcessFunction<String, Event, S
       }
       // 兼容快照缺失时跳过该日。未知稀有度不能当成 0 台主机。规则筛选不使用 fleet。
       if (config.historyCompare && !fleetReady(family, entry.getKey(), familyFleet)) {
-        LOG.info(
-            "Window waiting for fleet snapshot: family={}, targetDay={}, fleetMode={}",
-            family,
-            target,
-            config.get("fleet.mode", "legacy_snapshot"));
+        logWait(family, entry.getKey(), "fleet:" + config.get("fleet.mode", "legacy_snapshot"));
         continue;
+      }
+      String previousWait = readinessWaits.get(entry.getKey());
+      if (previousWait != null) {
+        LOG.info("Daily window ready: family={}, targetDay={}, previousWait={}", family, target, previousWait);
+        readinessWaits.remove(entry.getKey());
       }
       long evaluationStarted = System.nanoTime();
       MiningEngine.Result result =
           MiningEngine.evaluate(family, target, days, evaluationConfig(family, familyFleet));
-      LOG.info(
+      LOG.debug(
           "Window evaluated: family={}, targetDay={}, dayEvents={}, sealed={}, signals={}, shallowCandidates={}, complete={}, elapsedMillis={}",
           family,
           target,
@@ -389,7 +396,7 @@ public class MiningProcessFunction extends KeyedProcessFunction<String, Event, S
           complete,
           (System.nanoTime() - evaluationStarted) / 1_000_000);
       if (unchanged(entry.getKey(), result, complete)) {
-        LOG.info(
+        LOG.debug(
             "Unchanged snapshot suppressed: family={}, targetDay={}, complete={}",
             family,
             target,
@@ -399,6 +406,14 @@ public class MiningProcessFunction extends KeyedProcessFunction<String, Event, S
       emit(timestamp, ctx, out, entry.getKey(), target, result, complete);
     }
     return nextFinal;
+  }
+
+  /** Report readiness changes once per day rather than on every flush. */
+  private void logWait(String family, String day, String reason) throws Exception {
+    if (!reason.equals(readinessWaits.get(day))) {
+      LOG.info("Daily window waiting: family={}, targetDay={}, reason={}", family, day, reason);
+      readinessWaits.put(day, reason);
+    }
   }
 
   /** 第一个尚未封账的基线日。全部封账时返回 null。 */

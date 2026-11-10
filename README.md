@@ -21,7 +21,9 @@ java -cp target/sls-hunter-flink-mining-1.0.0-SNAPSHOT.jar \
 
 文件路径由 JVM 的 `-Dlog.file` 决定。YARN 上 JobManager 是 `jobmanager.log`，TaskManager 是 `taskmanager.log`。若 Web UI 报 `The file LOG does not exist on the TaskExecutor`，表示页面要读取的 `LOG` 不存在，并非这条错误就能证明作业失败。直接看对应 container 目录里的 `taskmanager.log` 或 `jobmanager.log`。
 
-`ReplayJob` 的 JSON 结果仍输出到标准输出，可用 `> /tmp/mining-results.jsonl` 保存；这些业务结果不是运行日志。INFO 记录作业与 Kafka 路由摘要、算子初始化、每条输入的接收、接纳、缓冲、折入日桶、跳过原因、FLEET 更新、日封账、迟到路由、刷新汇总、基线或 fleet 未就绪、目标日早于起始日、窗口评估、未变化快照、过期状态清理、交给 Kafka sink 的记录和输出快照摘要。无法解析或越过时钟偏差的输入以 WARN 记录后送入 DLQ。身份容量超限记录 ERROR 后继续按原逻辑抛错。日志带 topic、partition、offset 和 event id，不打印原始输入、信号内容或 Kafka 认证配置。快照和 sink 日志只表示交给下游，不表示事务已提交；恢复重放可能重复出现同一条输入和同一修订的日志。独立 `java -cp` 回放不自带 Log4j 2 后端。
+`ReplayJob` 的 JSON 结果仍输出到标准输出，可用 `> /tmp/mining-results.jsonl` 保存；这些业务结果不是运行日志。INFO 保留作业与 Kafka 路由、算子初始化、FLEET 更新和日封账、日窗口基线等待原因变化及就绪、固定窗口首次计算汇总、快照修订和状态清理。固定窗口汇总包含事件数、基线就绪情况与高危/历史信号数；快照日志表示交给下游，Kafka 事务仍待提交。逐条接收、接纳、去重、迟到路由、定时器、刷新细节和未变化快照降为 DEBUG，排查时可按需启用。两个算子的 `lateEvents` 和 `duplicateEvents` Flink 计数器可用于监控，计数随算子重启而重置。
+
+无法解析或越过时钟偏差的输入以 WARN 记录后送入 DLQ；批次迟到汇总和过期封账也以 WARN 记录。身份容量超限会抛错。日志不打印原始输入、信号内容或 Kafka 认证配置；恢复重放时日志可能重复。独立 `java -cp` 回放不自带 Log4j 2 后端。
 
 ## Kafka 输入
 
