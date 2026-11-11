@@ -157,6 +157,27 @@ class WindowMiningTest {
   }
 
   @Test
+  void emptyRecalculationAfterPublishedSnapshotIsNotEmitted() throws Exception {
+    long start = Instant.parse("2026-06-10T02:00:00Z").toEpochMilli();
+    OperatorSubtaskState checkpoint;
+    try (KeyedOneInputStreamOperatorTestHarness<String, Event, String> h =
+        harness(config(60_000, 10_000, 0))) {
+      h.open();
+      send(h, at("shell", start, "10.0.0.2", "bash", SHELL));
+      h.processWatermark(new Watermark(start + 60_000));
+      assertEquals(1, h.extractOutputValues().size());
+      checkpoint = h.snapshot(1, start);
+    }
+    try (KeyedOneInputStreamOperatorTestHarness<String, Event, String> h =
+        harness(config(60_000, 10_000, 100))) {
+      h.initializeState(checkpoint);
+      h.open();
+      h.processWatermark(new Watermark(start + 70_000));
+      assertTrue(h.extractOutputValues().isEmpty());
+    }
+  }
+
+  @Test
   void lateEventCorrectsUntilTheWindowIsPurged() throws Exception {
     long start = Instant.parse("2026-06-10T02:00:00Z").toEpochMilli();
     try (KeyedOneInputStreamOperatorTestHarness<String, Event, String> harness =

@@ -299,7 +299,7 @@ public class WindowMiningFunction extends KeyedProcessFunction<String, Event, St
                 result.stats()));
     boolean longTerm = watermark >= start + config.windowSizeMillis + config.latenessMillis
         && (!config.historyCompare || ready);
-    if ((scored.isEmpty() && meta.revision == 0) || (signature.equals(meta.signature) && !longTerm)) {
+    if (scored.isEmpty() || (signature.equals(meta.signature) && !longTerm)) {
       LOG.debug(
           "Fixed window snapshot suppressed: family={}, windowStart={}, signals={}",
           family,
