@@ -106,3 +106,7 @@ Linux 规则只将编辑或安装 crontab、向计划任务目录写入作为持
 当前 Java 日历日主链已实现；旧任意秒级范围中混合查询边界的缺陷没有复制为新的 API。`ReplayJob` 当前同样按日评估。旧 HDFS 五文件和 `agent_bundle` 报告打包层未迁移，输出是新的实时快照协议；它不能直接替代依赖旧报告格式的消费者。ES terms 主机截断、ES wildcard 在不同 mapping 下的索引语义和同分并发排序可能与 Java 全字段匹配存在差异，需用实际冻结输入验收。旧评分样本仅覆盖有限场景，地址分类已有有意差异，不代表全量端到端等价。
 
 [详细目标架构与后续扩展设计](docs/realtime-design.md)描述的是完整演进方案；其中分布式细键状态和任意范围回放不应误认为本版已经实现。
+
+## Telegram 高危告警
+
+独立 Java 17 / Spring Boot 服务读取固定窗口 Kafka 快照并发送 Telegram 群告警。配置、运行和投递语义见 [telegram-alert-java/README.md](telegram-alert-java/README.md)。
