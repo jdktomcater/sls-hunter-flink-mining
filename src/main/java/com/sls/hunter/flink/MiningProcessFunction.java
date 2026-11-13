@@ -109,7 +109,7 @@ public class MiningProcessFunction extends KeyedProcessFunction<String, Event, S
     LocalDate top = highest == null ? day : LocalDate.parse(highest);
     if (day.isBefore(retentionStart(top))) {
       lateEvents.inc();
-      LOG.debug(
+      LOG.info(
           "Input routed to late output: family={}, kind={}, day={}, id={}, retentionStart={}, highestDay={}, stage=ingress",
           ctx.getCurrentKey(),
           event.kind,
@@ -132,8 +132,8 @@ public class MiningProcessFunction extends KeyedProcessFunction<String, Event, S
     String pendingKey = Json.write(J8.list(event.day, event.kind, event.id));
     boolean replacedPending = pendingEvents.contains(pendingKey);
     pendingEvents.put(pendingKey, Json.write(event));
-    LOG.debug(
-        "Input buffered: family={}, kind={}, day={}, id={}, highestDay={}, replacedPending={}",
+    LOG.info(
+        "Daily input buffered: family={}, kind={}, day={}, id={}, highestDay={}, replacedPending={}",
         ctx.getCurrentKey(),
         event.kind,
         event.day,
@@ -257,7 +257,7 @@ public class MiningProcessFunction extends KeyedProcessFunction<String, Event, S
       if (LocalDate.parse(event.day).isBefore(cutoff)) {
         late++;
         lateEvents.inc();
-        LOG.debug(
+        LOG.info(
             "Input routed to late output: family={}, kind={}, day={}, id={}, retentionStart={}, stage=flush",
             ctx.getCurrentKey(),
             event.kind,
@@ -293,14 +293,14 @@ public class MiningProcessFunction extends KeyedProcessFunction<String, Event, S
       } else if (bucket.identities.contains(event.id)) {
         skipped++;
         duplicateEvents.inc();
-        LOG.debug(
+        LOG.info(
             "Input skipped: family={}, day={}, id={}, reason=duplicateIdentity",
             ctx.getCurrentKey(),
             event.day,
             event.id);
       } else if (bucket.add(event)) {
         accepted++;
-        LOG.debug(
+        LOG.info(
             "Input folded into day bucket: family={}, day={}, id={}, dayEvents={}, sealed={}",
             ctx.getCurrentKey(),
             event.day,
@@ -309,7 +309,7 @@ public class MiningProcessFunction extends KeyedProcessFunction<String, Event, S
             bucket.sealed);
       } else {
         skipped++;
-        LOG.debug(
+        LOG.info(
             "Input skipped: family={}, day={}, id={}, reason=dayEndSubsecond",
             ctx.getCurrentKey(),
             event.day,

@@ -3,6 +3,7 @@ package com.sls.hunter.flink;
 import java.nio.charset.StandardCharsets;
 import java.time.DateTimeException;
 import java.time.Duration;
+import java.time.Instant;
 import java.time.LocalDate;
 import java.util.Arrays;
 import java.util.Collections;
@@ -172,15 +173,16 @@ public final class MiningJob {
         event =
             Event.parse(record.value, record.topic, record.partition, record.offset, topicFamilies);
         rejectTooFarAhead(event);
-        LOG.debug(
-            "Input accepted: topic={}, partition={}, offset={}, family={}, kind={}, day={}, id={}",
+        LOG.info(
+            "Input accepted: topic={}, partition={}, offset={}, family={}, kind={}, day={}, id={}, eventTime={}",
             record.topic,
             record.partition,
             record.offset,
             event.family,
             event.kind,
             event.day,
-            event.id);
+            event.id,
+            Instant.ofEpochMilli(event.time));
         out.collect(event);
       } catch (IllegalArgumentException | DateTimeException ex) {
         if (event == null) {

@@ -105,23 +105,14 @@ public class WindowMiningFunction extends KeyedProcessFunction<String, Event, St
     if (watermark >= end + config.retentionDays * DAY_MS
         || (watermark >= end + config.latenessMillis && !buckets.contains(start))) {
       lateEvents.inc();
-      LOG.debug(
-          "Input routed to late output: family={}, windowStart={}, id={}, watermark={}",
-          ctx.getCurrentKey(),
-          start,
-          event.id,
-          watermark);
+      logRoute(ctx.getCurrentKey(), event, start, end, watermark, "late");
       ctx.output(LATE, Json.write(Json.obj("reason", "fixed_window_late", "event", event)));
       return;
     }
     DayBucket bucket = readBucket(start);
     if (!(config.historyCompare ? bucket.addWindowHistory(event) : bucket.add(event, false))) {
       duplicateEvents.inc();
-      LOG.debug(
-          "Input skipped: family={}, windowStart={}, id={}, reason=duplicateIdentity",
-          ctx.getCurrentKey(),
-          start,
-          event.id);
+      logRoute(ctx.getCurrentKey(), event, start, end, watermark, "duplicate");
       return;
     }
     if (config.historyCompare) WindowMining.recordHighRisk(bucket, event);
@@ -133,12 +124,14 @@ public class WindowMiningFunction extends KeyedProcessFunction<String, Event, St
     writeBucket(start, bucket);
     Meta meta = meta(start);
     if (meta.closed || watermark >= end) {
+      logRoute(ctx.getCurrentKey(), event, start, end, watermark, "republish");
       publish(ctx.getCurrentKey(), out, start, bucket, meta, ctx.timerService().currentProcessingTime(), ctx.timerService().currentWatermark(), ctx.timerService(), false);
       meta.closed = true;
       remember(ctx, start, end, meta, watermark);
       if (config.historyCompare) recomputeDependents(ctx, out, start);
       return;
     }
+    logRoute(ctx.getCurrentKey(), event, start, end, watermark, "waiting");
     if (config.historyCompare) recomputeDependents(ctx, out, start);
     if (!meta.timerArmed) {
       ctx.timerService().registerEventTimeTimer(end);
@@ -426,6 +419,19 @@ public class WindowMiningFunction extends KeyedProcessFunction<String, Event, St
         ready,
         decorated.size(),
         deleted.size());
+  }
+
+  /** 一条事件在固定窗口上的去向。不打印命令正文。水位还没有时写 none。 */
+  private static void logRoute(String family, Event event, long start, long end, long watermark, String route) {
+    LOG.info(
+        "Fixed-window input routed: family={}, id={}, eventTime={}, windowStart={}, windowEnd={}, watermark={}, route={}",
+        family,
+        event.id,
+        Instant.ofEpochMilli(event.time),
+        Instant.ofEpochMilli(start),
+        Instant.ofEpochMilli(end),
+        watermark == Long.MIN_VALUE ? "none" : Instant.ofEpochMilli(watermark),
+        route);
   }
 
   private DayBucket readBucket(long start) throws Exception {

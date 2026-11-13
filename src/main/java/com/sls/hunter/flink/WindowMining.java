@@ -9,9 +9,13 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /** Fixed-window rule evaluation. History consists of explicitly complete same-time slots. */
 final class WindowMining {
+  private static final Logger LOG = LoggerFactory.getLogger(WindowMining.class);
+
   private WindowMining() {}
 
   static long windowStart(long eventTime, long windowSizeMillis) {
@@ -39,7 +43,18 @@ final class WindowMining {
         String key = Json.write(J8.list(event.s("host_ip"), event.s("username"), event.s("proc_name")));
         DayBucket.Aggregate aggregate = bucket.windowStructural.computeIfAbsent(key, ignored -> new DayBucket.Aggregate());
         aggregate.add(event, 5);
-        for (Object reason : (List<?>) reasons) aggregate.structuralReasons.add(String.valueOf(reason));
+        List<String> matched = new ArrayList<>();
+        for (Object reason : (List<?>) reasons) {
+          String name = String.valueOf(reason);
+          aggregate.structuralReasons.add(name);
+          if (highRisk.contains(name)) matched.add(name);
+        }
+        LOG.info(
+            "High-risk structure matched: family={}, id={}, host={}, reasons={}",
+            event.family,
+            event.id,
+            event.s("host_ip"),
+            matched);
       }
     }
     if (!event.family.equals("tracing_sas_linux")) return;
@@ -51,6 +66,13 @@ final class WindowMining {
       if (!Behavior.included(pattern, event)) continue;
       String key = Json.write(J8.list(pattern.get("label"), event.s("host_ip")));
       bucket.windowHighRisk.computeIfAbsent(key, ignored -> new DayBucket.Aggregate()).add(event, 5);
+      LOG.info(
+          "High-risk behavior matched: family={}, id={}, host={}, label={}, severity={}",
+          event.family,
+          event.id,
+          event.s("host_ip"),
+          pattern.get("label"),
+          severity);
     }
   }
 
