@@ -178,6 +178,61 @@ class WindowMiningTest {
   }
 
   @Test
+  void emptyRecalculationAtDeadlineRetractsAndThenBecomesStable() throws Exception {
+    long start = Instant.parse("2026-06-10T02:00:00Z").toEpochMilli();
+    OperatorSubtaskState checkpoint;
+    try (KeyedOneInputStreamOperatorTestHarness<String, Event, String> h =
+        harness(config(60_000, 10_000, 0))) {
+      h.open();
+      send(h, at("shell", start, "10.0.0.2", "bash", SHELL));
+      h.processWatermark(new Watermark(start + 60_000));
+      checkpoint = h.snapshot(1, start);
+    }
+    try (KeyedOneInputStreamOperatorTestHarness<String, Event, String> h =
+        harness(config(60_000, 10_000, 100))) {
+      h.initializeState(checkpoint);
+      h.open();
+      h.setProcessingTime(720_000);
+      Map<String, Object> corrected = Json.map(h.extractOutputValues().get(0));
+      assertEquals("CORRECTED", corrected.get("status"));
+      assertTrue(signals(corrected).isEmpty());
+      assertEquals(1, ((List<?>) corrected.get("deleted_signal_ids")).size());
+      h.setProcessingTime(1_439_999);
+      assertEquals(1, h.extractOutputValues().size());
+      h.setProcessingTime(1_440_000);
+      Map<String, Object> lts = Json.map(h.extractOutputValues().get(1));
+      assertEquals("LTS", lts.get("status"));
+      assertEquals(3L, ((Number) lts.get("revision")).longValue());
+      assertTrue(signals(lts).isEmpty());
+    }
+  }
+
+  @Test
+  void duplicateInputRearmsMissingLegacyStabilityTimer() throws Exception {
+    long start = Instant.parse("2026-06-10T02:00:00Z").toEpochMilli();
+    try (KeyedOneInputStreamOperatorTestHarness<String, Event, String> h =
+        harness(config(60_000, 10_000, 0))) {
+      h.open();
+      Event event = at("shell", start, "10.0.0.2", "bash", SHELL);
+      send(h, event);
+      h.processWatermark(new Watermark(start + 60_000));
+      h.getOperator().setCurrentKey("tracing_sas_linux");
+      MapState<Long, String> metas = h.getOperator().getKeyedStateBackend().getPartitionedState(
+          VoidNamespace.INSTANCE, VoidNamespaceSerializer.INSTANCE,
+          new MapStateDescriptor<Long, String>("fixed-window-meta-v1", Long.class, String.class));
+      Map<String, Object> oldMeta = Json.map(metas.get(start));
+      oldMeta.remove("stabilityDeadline");
+      metas.put(start, Json.write(oldMeta));
+      h.setProcessingTime(1000);
+      send(h, event);
+      h.setProcessingTime(720_000);
+      assertEquals(1, h.extractOutputValues().size());
+      h.setProcessingTime(721_000);
+      assertEquals("LTS", Json.map(h.extractOutputValues().get(1)).get("status"));
+    }
+  }
+
+  @Test
   void lateEventCorrectsUntilTheWindowIsPurged() throws Exception {
     long start = Instant.parse("2026-06-10T02:00:00Z").toEpochMilli();
     try (KeyedOneInputStreamOperatorTestHarness<String, Event, String> h = harness(config(60_000, 10_000, 0))) {

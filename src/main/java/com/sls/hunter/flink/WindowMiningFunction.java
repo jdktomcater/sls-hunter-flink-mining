@@ -23,7 +23,7 @@ import org.slf4j.LoggerFactory;
  * 按索引族切分的固定事件时间窗口。窗口对齐到 {@code window.size.ms}，关闭时用和按日作业相同的结构规则、行为规则打分。
  *
  * <p>保留期内的补录会整窗重算并抬高 revision，静默 12 分钟后进入可再次修正的 LTS。超期事件进 late 侧输出。没有达到 {@code window.min.score}
- * 的信号不进入快照；一个窗口一条都没有时不写出。
+ * 的信号不进入快照；从未发布过信号的空窗口不写出，已发布窗口变空时发送撤回快照。
  */
 public class WindowMiningFunction extends KeyedProcessFunction<String, Event, String> {
   private static final Logger LOG = LoggerFactory.getLogger(WindowMiningFunction.class);
@@ -110,6 +110,13 @@ public class WindowMiningFunction extends KeyedProcessFunction<String, Event, St
       return;
     }
     DayBucket bucket = readBucket(start);
+    Meta meta = meta(start);
+    // Legacy restored state may have no processing-time timer. Any subsequent input,
+    // including a duplicate, gives that window another chance to become stable.
+    if (meta.closed && meta.revision > 0 && !meta.longTerm && meta.stabilityDeadline == 0) {
+      armStability(start, meta, ctx.timerService().currentProcessingTime(), ctx.timerService());
+      metas.put(start, Json.write(meta.toMap()));
+    }
     if (!(config.historyCompare ? bucket.addWindowHistory(event) : bucket.add(event, false))) {
       duplicateEvents.inc();
       logRoute(ctx.getCurrentKey(), event, start, end, watermark, "duplicate");
@@ -122,7 +129,6 @@ public class WindowMiningFunction extends KeyedProcessFunction<String, Event, St
       throw new IllegalStateException("Fixed-window identity capacity exceeded");
     }
     writeBucket(start, bucket);
-    Meta meta = meta(start);
     if (meta.closed || watermark >= end) {
       logRoute(ctx.getCurrentKey(), event, start, end, watermark, "republish");
       publish(ctx.getCurrentKey(), out, start, bucket, meta, ctx.timerService().currentProcessingTime(), ctx.timerService().currentWatermark(), ctx.timerService(), false);
@@ -155,11 +161,13 @@ public class WindowMiningFunction extends KeyedProcessFunction<String, Event, St
         long start = ((Number) value).longValue();
         Meta meta = meta(start);
         if (meta.stabilityDeadline == timestamp && !meta.longTerm && buckets.contains(start)) {
+          // A changed evaluation may arm a fresh deadline; do not clear it afterward.
+          meta.stabilityDeadline = 0;
           publish(ctx.getCurrentKey(), out, start, readBucket(start), meta,
               ctx.timerService().currentProcessingTime(), ctx.timerService().currentWatermark(),
               ctx.timerService(), true);
-          meta.stabilityDeadline = 0;
-          if (ctx.timerService().currentWatermark() >= start + config.windowSizeMillis + config.retentionDays * DAY_MS) {
+          if (meta.stabilityDeadline == 0
+              && ctx.timerService().currentWatermark() >= start + config.windowSizeMillis + config.retentionDays * DAY_MS) {
             buckets.remove(start);
             metas.remove(start);
           } else {
@@ -328,8 +336,11 @@ public class WindowMiningFunction extends KeyedProcessFunction<String, Event, St
                 result.shallow(),
                 "stats",
                 result.stats()));
-    boolean longTerm = stable;
-    if (scored.isEmpty() || (signature.equals(meta.signature) && (!longTerm || meta.longTerm))) {
+    boolean unchanged = signature.equals(meta.signature);
+    // A timer can discover a changed baseline or rules after recovery. The changed
+    // snapshot must first spend a full quiet period as CORRECTED.
+    boolean longTerm = stable && unchanged;
+    if ((scored.isEmpty() && meta.revision == 0) || (unchanged && (!longTerm || meta.longTerm))) {
       LOG.debug(
           "Fixed window snapshot suppressed: family={}, windowStart={}, signals={}",
           family,
