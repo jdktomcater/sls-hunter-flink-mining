@@ -32,7 +32,9 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
- * Kafka 作业入口。按索引族分区计算。完整性来自同一分区里的 SEAL，不使用 watermark 推断来源已经到齐。
+ * 待后续废弃的按日 Kafka 作业入口。核心业务入口为 {@link WindowMiningJob}。
+ *
+ * <p>按索引族分区计算。完整性来自同一分区里的 SEAL，不使用 watermark 推断来源已经到齐。
  *
  * <p>结果、非法输入和超出在线保留期的事件分三个 Kafka 事务 sink 写出。{@code jdbc.enabled=true} 时，结果快照再按窗口 upsert 到
  * PostgreSQL。

@@ -221,4 +221,41 @@ public class DayBucket {
       throw new IllegalStateException("Incompatible behavior rule state; replay input into a fresh state");
     }
   }
+
+  /** Merge disjoint fixed-window parts in arrival order, preserving the original sample selection. */
+  void mergeWindowPart(DayBucket part) {
+    requireCompatibleBehaviorState();
+    part.requireCompatibleBehaviorState();
+    identities.addAll(part.identities);
+    events += part.events;
+    if (part.events > 0) behaviorRulesVersion = part.behaviorRulesVersion;
+    if (Boolean.TRUE.equals(part.windowHistoryCompact)) windowHistoryCompact = true;
+    part.procHosts.forEach((proc, values) -> procHosts.computeIfAbsent(proc, k -> new TreeSet<>()).addAll(values));
+    part.hosts.forEach((host, count) -> hosts.merge(host, count, Long::sum));
+    mergeAggregates(triples, part.triples, TRIPLE_SAMPLES);
+    mergeAggregates(uris, part.uris, URI_SAMPLES);
+    mergeAggregates(upstreams, part.upstreams, 0);
+    mergeAggregates(windowHighRisk, part.windowHighRisk, 5);
+    mergeAggregates(windowStructural, part.windowStructural, 5);
+    part.behaviorHosts.forEach((rule, hosts) -> hosts.forEach((host, groups) ->
+        mergeAggregates(behaviorHosts.computeIfAbsent(rule, k -> new TreeMap<>())
+            .computeIfAbsent(host, k -> new TreeMap<>()), groups, PATTERN_SAMPLES)));
+    part.firstHost.forEach((host, samples) -> {
+      List<Event> target = firstHost.computeIfAbsent(host, k -> new ArrayList<>());
+      for (Event event : samples) keep(target, event, HOST_FIRST_LOGS, false);
+    });
+    fetchParentPaths.addAll(part.fetchParentPaths);
+  }
+
+  private static void mergeAggregates(Map<String, Aggregate> target, Map<String, Aggregate> source, int limit) {
+    source.forEach((key, part) -> {
+      Aggregate aggregate = target.computeIfAbsent(key, k -> new Aggregate());
+      aggregate.count += part.count;
+      for (Event event : part.samples) keep(aggregate.samples, event, limit, false);
+      aggregate.scoringEvents.addAll(part.scoringEvents);
+      part.commandTemplates.forEach((template, count) -> aggregate.commandTemplates.merge(template, count, Integer::sum));
+      part.chainSignatures.forEach((chain, count) -> aggregate.chainSignatures.merge(chain, count, Integer::sum));
+      aggregate.structuralReasons.addAll(part.structuralReasons);
+    });
+  }
 }

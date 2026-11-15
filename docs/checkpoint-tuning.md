@@ -58,4 +58,16 @@ Kafka 事务超时的配置检查包含 `max(checkpoint.interval.ms, checkpoint.
 
 部署后按每次 checkpoint 的每个 operator/subtask 记录 start delay、alignment、同步/异步耗时和状态大小，并结合 busy/backpressured、Kafka lag、GC、HDFS、慢状态/慢 JDBC 日志比较同等负载。高 start delay 与反压对应上下游 barrier 等待；同步耗时高时检查用户回调和 sink flush；异步耗时高时检查状态存储与网络。一次 checkpoint 的总耗时和增量大小不能证明是 Flink 状态、HDFS 还是数据库导致。参见 [Flink 1.18 checkpoint 监控](https://nightlies.apache.org/flink/flink-docs-release-1.18/docs/ops/monitoring/checkpoint_monitoring/) 和 [反压下 checkpoint](https://nightlies.apache.org/flink/flink-docs-release-1.18/docs/ops/state/checkpointing_under_backpressure/)。
 
-本次没有改为按事件/实体拆分的细粒度 Flink 状态：每条事件仍会读写整个窗口 JSON，单次读取、写入或 SEAL 扫描无法被本优化打断。没有线上压测数据，不能保证 checkpoint 超时已经消除。
+上述历史模式压缩之后，固定窗口状态进一步改为有界分块，见下节。没有线上压测数据，不能保证 checkpoint 超时已经消除。
+
+## 固定窗口有界分块状态
+
+`WindowMiningJob` 的普通输入不再读取和重写整个窗口 JSON。`WindowBucketState` 将每个窗口的新输入按接收顺序分为最多 128 条事件一个聚合块，去重身份用独立的托管 `MapState` 索引，另用小型 header 保存追加数量和身份数。每条接纳事件只更新当前块、一个身份和 header；已完成块不再因后续追加而重写。128 是状态布局常量，现有版本状态不能直接修改该值。
+
+窗口首次关闭、迟到修正、基线重算和 LTS 定时器仍在原来的时点组装完整 `DayBucket`，调用原有规则计算。组装按接收顺序合并全量计数、评分事件、模板、父链和命中原因；展示样本仍按原来的事件时间及 event_id 取相同的有界样本。没有对事件采样，没有合并多条迟到事件的输出，也没有改动 revision、撤回、空快照和 LTS 语义。
+
+保留原 `fixed-window-bucket-v1` 描述符及 operator UID。兼容的旧 checkpoint/savepoint 中，整窗桶作为只读基座保留；旧的历史压缩逻辑仍可一次性改写基座。首次追加时一次性为旧身份建立索引，后续只写新块。未被访问的旧窗口不需要预先迁移。规则版本不兼容或紧凑历史状态用于完整规则时仍明确失败。窗口清理同时删除旧基座、块、header 和身份索引。
+
+新增状态为 `fixed-window-parts-header-v1`、`fixed-window-parts-v1` 和 `fixed-window-identities-v1`。升级后 checkpoint 包含新事件块，不能直接交给只读取整窗桶的旧代码回滚，否则会遗漏新增事件；回滚须使用升级前 savepoint，并处理 Kafka 位点及数据库 revision。升级应在隔离环境验证 savepoint 恢复。
+
+本优化降低持续输入的序列化与重写放大，不保证总状态量下降：身份索引和块内样本有额外存储成本。单事件大小仍无字节上限；首次旧状态索引、完整窗口组装、迟到重算、SEAL 扫描、清理和 JDBC flush 仍同步执行。`keyBy(family)` 的并行边界不变，持续迟到流量仍会逐条触发原有整窗计算。应继续对比同等负载下的 CPU、GC、RocksDB 写入、checkpoint 分项、Kafka lag 和结果延迟。

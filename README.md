@@ -1,5 +1,7 @@
 # SLS Hunter Flink Mining
 
+核心业务入口为 `WindowMiningJob`（固定时间窗口任务）。`MiningJob`（按日任务）标记为后续废弃，现阶段保留兼容；下文涉及按日任务的说明仅供存量任务维护参考。
+
 独立 Java 8 / Flink 1.18.1 / Kafka DataStream 项目，使用 Dinky 提交 JAR。原 Spark 项目不参与运行。四族规则、进程集合、Windows 资产规则与 Linux 行为查询已移植，纯 Java 运行，不需要 JEP 或 Python。
 
 ## 构建与回放
@@ -75,7 +77,7 @@ Linux 规则只将编辑或安装 crontab、向计划任务目录写入作为持
 
 **本次规则升级需要从输入重新回放日作业和固定窗口作业。** 旧状态缺少完整命令、模板及父链信息，也无法准确转换早期行为聚合。读取不兼容的非空旧状态时作业会明确失败，不能直接从旧 savepoint 升级。请使用新的消费组、checkpoint 和隔离输出，从所需基线期开始回放并核验后再切换。
 
-两个作业的 checkpoint 超时配置、优化边界与上线验证见 [checkpoint 排查说明](docs/checkpoint-tuning.md)。
+两个作业的 checkpoint 超时配置、优化边界与上线验证见 [checkpoint 排查说明](docs/checkpoint-tuning.md)。固定窗口输入已改为最多 128 条事件一个聚合块，独立索引去重身份；普通输入只更新当前块，计算快照时才组装完整窗口。兼容旧整窗状态按需迁移，升级后的新 checkpoint 不可直接用于旧代码回滚。业务规则、迟到修正及输出时点不变。
 
 ## 固定时间窗口
 

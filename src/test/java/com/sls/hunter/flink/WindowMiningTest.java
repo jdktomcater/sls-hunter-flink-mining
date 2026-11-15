@@ -633,7 +633,7 @@ class WindowMiningTest {
       send(h, at("new", start + 1, "h", "bash", SHELL));
       DayBucket stored = Json.MAPPER.readValue(state.get(start), DayBucket.class);
       assertEquals(Boolean.TRUE, stored.windowHistoryCompact);
-      assertEquals(2L, stored.events);
+      assertEquals(1L, stored.events); // The legacy base is not rewritten for new events.
       assertTrue(stored.triples.values().iterator().next().scoringEvents.isEmpty());
       checkpoint = h.snapshot(13, start + 2);
     }
@@ -678,6 +678,87 @@ class WindowMiningTest {
         .filter(row -> "window_spike_triple".equals(row.get("signal_type"))).findFirst().get();
     assertEquals(2.0, ((Number) signal.get("baseline_average")).doubleValue());
     assertEquals(3.0, ((Number) signal.get("spike_ratio")).doubleValue());
+  }
+
+  @Test
+  void multiPartWindowPreservesSnapshotsCorrectionsTimersAndCleanupAcrossRestore() throws Exception {
+    long start = Instant.parse("2026-06-10T02:00:00Z").toEpochMilli();
+    for (boolean history : new boolean[] {false, true}) {
+      MiningConfig settings = history ? historyConfig() : config(60_000, 10_000, 0);
+      DayBucket reference = new DayBucket();
+      OperatorSubtaskState checkpoint;
+      try (KeyedOneInputStreamOperatorTestHarness<String, Event, String> h = harness(settings)) {
+        h.open();
+        if (history) send(h, seal("2026-06-09"));
+        for (int i = 0; i < 2 * WindowBucketState.PART_EVENTS + 3; i++) {
+          Event event = at("part-" + i, start + (300 - i), "h", "bash", i % 17 == 0 ? SHELL : "echo normal");
+          addReference(reference, event, history); send(h, event);
+        }
+        assertTrue(h.extractOutputValues().isEmpty());
+        checkpoint = h.snapshot(71, start);
+      }
+      try (KeyedOneInputStreamOperatorTestHarness<String, Event, String> h = harness(settings)) {
+        h.initializeState(checkpoint); h.open();
+        h.processWatermark(new Watermark(start + 60_000));
+        Map<String, Object> first = Json.map(h.extractOutputValues().get(0));
+        assertEquals("FINAL", first.get("status"));
+        assertEquals(1L, ((Number) first.get("revision")).longValue());
+        assertReferenceSignals(reference, settings, first);
+        h.setProcessingTime(1000);
+        Event late = at("late-part", start + 2, "h", "bash", SHELL);
+        addReference(reference, late, history); send(h, late);
+        assertEquals(2, h.extractOutputValues().size());
+        Map<String, Object> corrected = Json.map(h.extractOutputValues().get(1));
+        assertEquals("CORRECTED", corrected.get("status"));
+        assertEquals(2L, ((Number) corrected.get("revision")).longValue());
+        assertReferenceSignals(reference, settings, corrected);
+        send(h, late);
+        assertEquals(2, h.extractOutputValues().size());
+        checkpoint = h.snapshot(72, start + 1);
+      }
+      try (KeyedOneInputStreamOperatorTestHarness<String, Event, String> h = harness(settings)) {
+        h.initializeState(checkpoint); h.open();
+        h.processWatermark(new Watermark(start + 60_000));
+        h.setProcessingTime(721_000);
+        assertEquals(1, h.extractOutputValues().size());
+        Map<String, Object> stable = Json.map(h.extractOutputValues().get(0));
+        assertEquals("LTS", stable.get("status"));
+        assertEquals(3L, ((Number) stable.get("revision")).longValue());
+        assertReferenceSignals(reference, settings, stable);
+        h.processWatermark(new Watermark(start + 60_000 + settings.retentionDays * 86_400_000L));
+        h.getOperator().setCurrentKey("tracing_sas_linux");
+        assertTrue(h.getOperator().getKeyedStateBackend().getPartitionedState(
+            VoidNamespace.INSTANCE, VoidNamespaceSerializer.INSTANCE,
+            new MapStateDescriptor<>("fixed-window-parts-v1", Types.TUPLE(Types.LONG, Types.LONG), Types.STRING)).isEmpty());
+        assertTrue(h.getOperator().getKeyedStateBackend().getPartitionedState(
+            VoidNamespace.INSTANCE, VoidNamespaceSerializer.INSTANCE,
+            new MapStateDescriptor<>("fixed-window-identities-v1", Types.TUPLE(Types.LONG, Types.STRING), Types.BOOLEAN)).isEmpty());
+        send(h, at("after-purge", start + 3, "h", "bash", SHELL));
+        assertEquals(1, h.getSideOutput(WindowMiningFunction.LATE).size());
+      }
+    }
+  }
+
+  private static void addReference(DayBucket bucket, Event event, boolean history) {
+    if (history) {
+      if (bucket.addWindowHistory(event)) WindowMining.recordHighRisk(bucket, event);
+    } else bucket.add(event, false);
+  }
+
+  private static void assertReferenceSignals(DayBucket reference, MiningConfig settings, Map<String, Object> snapshot) {
+    MiningEngine.Result result = settings.historyCompare
+        ? WindowMining.evaluateChannels("tracing_sas_linux", reference, Collections.singletonList(new DayBucket()), true, settings)
+        : WindowMining.evaluate("tracing_sas_linux", reference, LocalDate.parse("2026-06-10"), settings);
+    java.util.ArrayList<Map<String, Object>> expected = new java.util.ArrayList<>();
+    for (Map<String, Object> signal : WindowMining.highScores(result.signals(), settings.windowMinScore)) {
+      Map<String, Object> row = new java.util.LinkedHashMap<>(signal);
+      row.put("signal_id", MiningProcessFunction.signalId("tracing_sas_linux", snapshot.get("window_start").toString(), signal));
+      row.put("target_day", "2026-06-10");
+      row.put("window_start", snapshot.get("window_start"));
+      expected.add(row);
+    }
+    assertEquals(Json.map(Json.write(Json.obj("signals", expected))).get("signals"), snapshot.get("all_signals"));
+    assertTrue(((List<?>) snapshot.get("deleted_signal_ids")).isEmpty());
   }
 
 }
